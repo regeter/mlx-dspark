@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+# local model/drafter weights
+checkpoints/
+*.safetensors
+scratch/
+# local Claude skill copy (not part of the package)
+.claude/
+# private dev/agent tracking notes (kept local, not published)
+CLAUDE.md
+NOTES.md

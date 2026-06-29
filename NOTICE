@@ -1,0 +1,22 @@
+mlx-dspark
+==========
+
+This project is an independent MLX/Apple-Silicon port of the *inference path* of
+DSpark, a speculative-decoding drafter open-sourced by DeepSeek as part of the
+DeepSpec codebase:
+
+  - DeepSpec: https://github.com/deepseek-ai/DeepSpec  (MIT License)
+
+It loads the published DSpark drafter checkpoints (also released by DeepSeek under
+their respective licenses):
+
+  - deepseek-ai/dspark_gemma4_12b_block7
+  - deepseek-ai/dspark_qwen3_4b_block7
+
+The drafter architecture, training, and checkpoints are the work of DeepSeek and
+the DeepSpec authors. This repository reimplements only the forward/verification
+path for MLX and contains no DeepSpec source code. Target models (Gemma-4, Qwen3)
+are downloaded at runtime from their respective publishers and are subject to
+their own licenses (e.g. the Gemma Terms of Use and the Qwen license).
+
+No model weights are bundled with this package.

@@ -1,0 +1,277 @@
+"""DSpark drafter in MLX — Gemma-4 and Qwen3 families.
+
+Faithful port of the DeepSpec inference path. The EAGLE-style cross-attention is shared:
+Q comes from the draft block, K/V from concat([fused_target_context, block]), with the
+context K/V cached per layer (CtxCache). Family differences (norm layout, rope, MLP act,
+v handling, logit softcap) are config-driven. Module attribute names match the HF
+checkpoints so weights load 1:1.
+"""
+
+from __future__ import annotations
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_vlm.models.gemma4.rope_utils import initialize_rope
+
+from .config import DSparkConfig
+
+
+class RMSNormNoScale(nn.Module):
+    """RMSNorm with no learnable weight (Gemma-4 v_norm)."""
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.fast.rms_norm(x, None, self.eps)
+
+
+def _act(name: str):
+    return nn.silu if name == "silu" else nn.gelu_approx
+
+
+class MLP(nn.Module):
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        h, i = config.hidden_size, config.intermediate_size
+        self.gate_proj = nn.Linear(h, i, bias=False)
+        self.up_proj = nn.Linear(h, i, bias=False)
+        self.down_proj = nn.Linear(i, h, bias=False)
+        self.act = _act(config.mlp_activation)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+
+
+def _repeat_kv(x: mx.array, n_rep: int) -> mx.array:
+    if n_rep == 1:
+        return x
+    b, n_kv, s, d = x.shape
+    x = mx.expand_dims(x, 2)
+    x = mx.broadcast_to(x, (b, n_kv, n_rep, s, d))
+    return x.reshape(b, n_kv * n_rep, s, d)
+
+
+class CtxCache:
+    """Per-layer cache of the target context's projected K/V (roped K, normed/raw V)."""
+
+    __slots__ = ("k", "v")
+
+    def __init__(self):
+        self.k = None
+        self.v = None
+
+    def append(self, k: mx.array, v: mx.array) -> None:
+        if self.k is None:
+            self.k, self.v = k, v
+        else:
+            self.k = mx.concatenate([self.k, k], axis=2)
+            self.v = mx.concatenate([self.v, v], axis=2)
+
+
+class DSparkAttention(nn.Module):
+    """Cross-attention: Q from the draft block, K/V from [target_context, block]."""
+
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.attn_head_dim
+        self.k_eq_v = config.attention_k_eq_v
+        self.n_kv_heads = config.n_kv_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.scale = config.scaling
+        self.use_v_norm = config.use_v_norm
+
+        h = config.hidden_size
+        b = config.attention_bias
+        self.q_proj = nn.Linear(h, self.n_heads * self.head_dim, bias=b)
+        self.k_proj = nn.Linear(h, self.n_kv_heads * self.head_dim, bias=b)
+        if not self.k_eq_v:
+            self.v_proj = nn.Linear(h, self.n_kv_heads * self.head_dim, bias=b)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, h, bias=b)
+
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        if self.use_v_norm:
+            self.v_norm = RMSNormNoScale(eps=config.rms_norm_eps)
+
+        self.rope = initialize_rope(
+            dims=self.head_dim, base=config.rope_theta, traditional=False,
+            scaling_config=config.rope_parameters,
+        )
+
+    def _kv(self, x: mx.array):
+        """Project x -> (roped+normed K, V). k_eq_v shares k_proj for V."""
+        B, S, _ = x.shape
+        kp = self.k_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_norm(kp)
+        if self.k_eq_v:
+            v = self.v_norm(kp)
+        else:
+            v = self.v_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            if self.use_v_norm:
+                v = self.v_norm(v)
+        return k, v
+
+    def update_ctx(self, fused_new: mx.array, ctx_offset: int, cache: CtxCache) -> None:
+        k, v = self._kv(fused_new)
+        cache.append(self.rope(k, offset=ctx_offset), v)   # V is not roped
+
+    def attend(self, hidden: mx.array, block_offset: int, cache: CtxCache) -> mx.array:
+        B, q_len, _ = hidden.shape
+        q = self.q_proj(hidden).reshape(B, q_len, self.n_heads, self.head_dim)
+        q = self.rope(self.q_norm(q).transpose(0, 2, 1, 3), offset=block_offset)
+
+        k_blk, v_blk = self._kv(hidden)
+        k_blk = self.rope(k_blk, offset=block_offset)
+        k = mx.concatenate([cache.k, k_blk], axis=2)
+        v = mx.concatenate([cache.v, v_blk], axis=2)
+
+        k = _repeat_kv(k, self.n_rep)
+        v = _repeat_kv(v, self.n_rep)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+        out = out.transpose(0, 2, 1, 3).reshape(B, q_len, -1)
+        return self.o_proj(out)
+
+
+class DSparkDecoderLayer(nn.Module):
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        eps = config.rms_norm_eps
+        self.norm_style = config.norm_style
+        self.self_attn = DSparkAttention(config)
+        self.mlp = MLP(config)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
+        if self.norm_style == "gemma":
+            self.pre_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
+            self.post_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
+            self.layer_scalar = mx.ones((1,))
+
+    def __call__(self, hidden, block_offset, cache: CtxCache):
+        if self.norm_style == "gemma":
+            residual = hidden
+            h = self.input_layernorm(hidden)
+            h = self.self_attn.attend(h, block_offset, cache)
+            h = self.post_attention_layernorm(h)
+            h = residual + h
+            residual = h
+            h = self.pre_feedforward_layernorm(h)
+            h = self.mlp(h)
+            h = self.post_feedforward_layernorm(h)
+            h = residual + h
+            return h * self.layer_scalar
+        # qwen / llama 2-norm
+        residual = hidden
+        h = self.input_layernorm(hidden)
+        h = self.self_attn.attend(h, block_offset, cache)
+        h = residual + h
+        residual = h
+        h = self.post_attention_layernorm(h)
+        h = self.mlp(h)
+        return residual + h
+
+
+class VanillaMarkov(nn.Module):
+    """Rank-256 previous-token correction: logits += w2(w1[prev_token])."""
+
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(config.vocab_size, config.markov_rank)
+        self.markov_w2 = nn.Linear(config.markov_rank, config.vocab_size, bias=False)
+
+    def prev_embeddings(self, token_ids: mx.array) -> mx.array:
+        return self.markov_w1(token_ids)
+
+    def step_bias(self, token_ids: mx.array) -> mx.array:
+        return self.markov_w2(self.markov_w1(token_ids))
+
+
+class ConfidenceHead(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, 1)
+
+    def __call__(self, features: mx.array) -> mx.array:
+        return self.proj(features).squeeze(-1)
+
+
+class DSparkDrafter(nn.Module):
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        self.config = config
+        self.block_size = config.block_size
+        self.mask_token_id = config.mask_token_id
+        self.embed_scale = (float(config.hidden_size) ** 0.5) if config.family == "gemma4" else 1.0
+        self.softcap = config.final_logit_softcapping
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.fc = nn.Linear(
+            len(config.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False
+        )
+        self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = [DSparkDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        self.markov_head = VanillaMarkov(config) if config.markov_rank > 0 else None
+        self.confidence_head = None
+        if config.enable_confidence_head:
+            in_dim = config.hidden_size + (config.markov_rank if config.confidence_head_with_markov else 0)
+            self.confidence_head = ConfidenceHead(in_dim)
+
+    def embed(self, ids: mx.array) -> mx.array:
+        return self.embed_tokens(ids) * self.embed_scale
+
+    def fuse_target(self, target_hidden_cat: mx.array) -> mx.array:
+        return self.hidden_norm(self.fc(target_hidden_cat))
+
+    def make_ctx_cache(self) -> list[CtxCache]:
+        return [CtxCache() for _ in self.layers]
+
+    def update_context(self, target_hidden_cat, ctx_offset, ctx_caches) -> None:
+        fused = self.fuse_target(target_hidden_cat)
+        for layer, cache in zip(self.layers, ctx_caches):
+            layer.self_attn.update_ctx(fused, ctx_offset, cache)
+
+    def backbone(self, noise_embedding, block_offset, ctx_caches) -> mx.array:
+        h = noise_embedding
+        for layer, cache in zip(self.layers, ctx_caches):
+            h = layer(h, block_offset, cache)
+        return self.norm(h)
+
+    def compute_logits(self, hidden: mx.array) -> mx.array:
+        logits = self.lm_head(hidden)
+        if self.softcap is not None:
+            logits = mx.tanh(logits / self.softcap) * self.softcap
+        return logits
+
+    def sample_block(self, base_logits: mx.array, first_prev_token: int) -> mx.array:
+        k = base_logits.shape[0]
+        if self.markov_head is None:
+            return mx.argmax(base_logits, axis=-1)
+        tokens = []
+        prev = mx.array([first_prev_token])
+        for i in range(k):
+            step = base_logits[i] + self.markov_head.step_bias(prev)[0]
+            nxt = mx.argmax(step, axis=-1, keepdims=True)
+            tokens.append(nxt)
+            prev = nxt
+        return mx.concatenate(tokens)
+
+    def confidence_logits(self, block_hidden, prev_token_ids):
+        if self.confidence_head is None:
+            return None
+        if self.config.confidence_head_with_markov:
+            feats = mx.concatenate(
+                [block_hidden, self.markov_head.prev_embeddings(prev_token_ids)], axis=-1
+            )
+        else:
+            feats = block_hidden
+        return self.confidence_head(feats)
+
+
+# Backwards-compatible alias
+Gemma4DSparkDrafter = DSparkDrafter
