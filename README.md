@@ -19,14 +19,11 @@
   <img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" alt="Baseline vs DSpark — same output, ~1.8x faster on Gemma-4 12B" width="840">
 </p>
 
-```bash
-pip install mlx-dspark
-```
-
-DSpark is DeepSeek's semi-autoregressive, EAGLE-family speculative-decoding drafter, open-sourced in
-the [DeepSpec](https://github.com/deepseek-ai/DeepSpec) codebase and used to accelerate DeepSeek-V4.
-This ports the **inference path** to MLX so the published drafter checkpoints run natively on a Mac —
-**losslessly** (the target verifies every token, so output is identical to normal decoding).
+mlx-dspark runs two EAGLE-family speculative-decoding drafters natively on Apple Silicon: DeepSeek's
+**DSpark** (semi-autoregressive, from the [DeepSpec](https://github.com/deepseek-ai/DeepSpec) codebase,
+used to accelerate DeepSeek-V4) and z-lab's **DFlash** (block diffusion). Both are **lossless** — the
+target verifies every token, so output is identical to normal decoding — and run under one verify loop,
+so you can benchmark them head-to-head. `pip install mlx-dspark` (full setup in [Install](#install)).
 
 **Supported families** — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
 
@@ -35,10 +32,10 @@ This ports the **inference path** to MLX so the published drafter checkpoints ru
 | `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~32 GB+ |
 | `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~16 GB |
 
-DSpark (DeepSeek) and DFlash (z-lab) are two EAGLE-family drafters with different trade-offs; mlx-dspark
-runs both under one lossless verify loop so you can benchmark them head-to-head — see
-[DSpark vs DFlash](#dspark-vs-dflash--eagle3). **Any other z-lab DFlash adapter** (e.g.
-`Qwen3-8B-DFlash-b16`) runs too — see [Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter).
+The two drafters have different trade-offs (DSpark's Markov head wins open chat; DFlash's block-16
+wins code/math) — see [DSpark vs DFlash](#dspark-vs-dflash--eagle3) for the head-to-head. **Any other
+z-lab DFlash adapter** (e.g. `Qwen3-8B-DFlash-b16`) runs too — see
+[Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter).
 
 ## How it works
 
@@ -85,7 +82,10 @@ python -m mlx_dspark --family gemma4 --prompt "Explain how rainbows form." --max
 python -m mlx_dspark --family qwen3 --mode baseline --prompt "..." --max-new-tokens 400
 python -m mlx_dspark --family qwen3 --mode dspark   --prompt "..." --max-new-tokens 400
 
-# sampled (not greedy) — lossless wrt the target at temperature T (paper's method)
+# z-lab DFlash drafter instead (--max-draft 0 = full 16-block; best on code/math)
+python -m mlx_dspark --mode dflash --family gemma4 --max-draft 0 --prompt "Write a binary search."
+
+# sampled (not greedy) — lossless wrt the target at temperature T (works for dspark and dflash)
 python -m mlx_dspark --family qwen3 --prompt "Write a short poem." --temperature 1.0 --seed 0
 ```
 
@@ -107,18 +107,31 @@ res = dflash_generate(target, tok, drafter, "Write a binary search in Python.") 
 print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
-## Results (M4 Pro, warm; 8-bit instruct target, 4-bit drafter, cap=2)
+## Results (M4 Pro, warm; 8-bit instruct target, 4-bit drafter)
 
-Speedup is vs the **official MLX tools** running the same model (`mlx_lm.generate` / `mlx_vlm.generate`):
+**DSpark** vs the **official MLX tools** running the same model (`mlx_lm.generate` / `mlx_vlm.generate`),
+at its `cap=2` optimum:
 
 | family | drafter `d_0` | accept len | baseline (official) | mlx-dspark | speedup |
 |---|---|---|---|---|---|
 | **Gemma-4 12B** | ~82% | ~2.5 | 18.4 tok/s | ~30 tok/s | **~1.6×** (≤2× on code/math) |
 | **Qwen3-4B**    | ~85% | ~2.25 | 52.9 tok/s | ~73 tok/s | **~1.4×** |
 
-Both produce **identical** output — DSpark is just faster (it diverges from sequential greedy only
-at logit-margin≈0 ties). (`python benchmark.py`'s in-harness greedy baseline is ~5% slower than the
-official tools, so it shows a slightly higher ~1.73× / ~1.45× — we quote the conservative number.)
+**DFlash** (z-lab) trades the other way — its block-16 denoise shines on **structured** content. On
+Gemma-4 12B, full-block DFlash reaches **~2.1×** on code/math (accepted length ~6.0), while DSpark's
+Markov head keeps the lead on **open chat** (1.65×). They're complementary:
+
+| Gemma-4 12B (vs greedy ≈17.3 tok/s) | chat | code | math |
+|---|---|---|---|
+| DSpark (cap 2) | **1.65×** (acc 2.45) | 1.89× (2.78) | 1.89× (2.86) |
+| DFlash (full 16) | 0.98× (2.68) | **2.10×** (5.95) | **2.12×** (6.20) |
+
+Full per-method table + analysis in [DSpark vs DFlash](#dspark-vs-dflash--eagle3).
+
+All paths produce **identical** output to plain decoding — they're just faster (divergence from
+sequential greedy happens only at logit-margin≈0 ties). (`python benchmark.py`'s in-harness greedy
+baseline is ~5% slower than the official tools, so DSpark shows a slightly higher ~1.73× / ~1.45× —
+we quote the conservative number.)
 
 ### What to expect on Apple Silicon (the speedup ceiling)
 
@@ -170,12 +183,17 @@ So: **8-bit for the biggest spec benefit + best quality; 4-bit for max absolute 
 
 ### Tuning
 
-The target verify cost grows per token *and* the marginal draft token rarely survives, so the
-measured optimum for both families is **`--max-draft 2` (default)** — higher caps verify more
-tokens for little extra acceptance and are slower. The drafter only runs its lm_head + Markov head
-over these `cap` positions (the backbone stays full-width for faithful bidirectional block
-attention). `--max-draft <block>` (full 7) is faithful but *slower*. `--confidence-threshold 0.6`
+**DSpark** (`--mode dspark`): the target verify cost grows per token *and* the marginal draft token
+rarely survives, so the measured optimum for both families is **`--max-draft 2` (default)** — higher
+caps verify more tokens for little extra acceptance and are slower. The drafter only runs its lm_head
++ Markov head over these `cap` positions (the backbone stays full-width for faithful bidirectional
+block attention). `--max-draft <block>` (full 7) is faithful but *slower*. `--confidence-threshold 0.6`
 instead truncates the block adaptively via the drafter's confidence head.
+
+**DFlash** (`--mode dflash`): the trade-off flips with content. Use **`--max-draft 0`** (full 16-block,
+its native design point) on **code/math**, where acceptance reaches ~6 and the long block stays fast;
+use a short cap (`--max-draft 2`) on **open chat**, where the block doesn't fill and the full block
+becomes a net loss. Both `--temperature` (lossless sampling) and greedy are supported, same as DSpark.
 
 ## DSpark vs DFlash / EAGLE3
 
