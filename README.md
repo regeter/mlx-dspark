@@ -3,8 +3,9 @@
 </p>
 
 <p align="center">
-  <b>DeepSeek's DSpark speculative decoding — running natively on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>A lossless drafter that makes Gemma-4 12B and Qwen3-4B faster on a Mac — <b>~1.6× / ~1.4×</b>, same output.
+  <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — running natively on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
+  <br>Lossless drafters that make Gemma-4 12B and Qwen3-4B faster on a Mac — same output, with a built-in
+  <br>DSpark-vs-DFlash head-to-head (DSpark <b>~1.6× / ~1.4×</b>; DFlash up to <b>~2.1×</b> on code/math).
 </p>
 
 <p align="center">
@@ -27,12 +28,17 @@ the [DeepSpec](https://github.com/deepseek-ai/DeepSpec) codebase and used to acc
 This ports the **inference path** to MLX so the published drafter checkpoints run natively on a Mac —
 **losslessly** (the target verifies every token, so output is identical to normal decoding).
 
-**Supported families** (auto-detected from the drafter config):
+**Supported families** — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
 
-| family | target | drafter | RAM |
-|---|---|---|---|
-| `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | ~32 GB+ |
-| `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | ~16 GB |
+| family | target (instruct, 8-bit) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | RAM |
+|---|---|---|---|---|
+| `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~32 GB+ |
+| `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~16 GB |
+
+DSpark (DeepSeek) and DFlash (z-lab) are two EAGLE-family drafters with different trade-offs; mlx-dspark
+runs both under one lossless verify loop so you can benchmark them head-to-head — see
+[DSpark vs DFlash](#dspark-vs-dflash--eagle3). **Any other z-lab DFlash adapter** (e.g.
+`Qwen3-8B-DFlash-b16`) runs too — see [Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter).
 
 ## How it works
 
@@ -46,6 +52,10 @@ This ports the **inference path** to MLX so the published drafter checkpoints ru
 
 The drafter is loaded 1:1 from the HF checkpoint and **quantized to 4-bit** by default
 (~1.8 GB) so it's cheap to run every round.
+
+(That's DSpark. **DFlash** — `--mode dflash` — is a different drafter: a *block-diffusion* model that
+denoises a whole 16-token block in one parallel pass and reuses the target's own embed/lm-head. Same
+lossless verify loop, different trade-offs — see [DSpark vs DFlash](#dspark-vs-dflash--eagle3).)
 
 ## Install
 
@@ -84,6 +94,16 @@ from mlx_dspark import load_pair, speculative_generate
 
 target, tok, drafter, cfg = load_pair("qwen3")   # or "gemma4"
 res = speculative_generate(target, tok, drafter, "Explain how rainbows form.")
+print(res.text, res.mean_accept_len, res.tokens_per_sec)
+```
+
+Run z-lab's **DFlash** drafter instead (block-diffusion; strongest on code/math at the full block):
+
+```python
+from mlx_dspark import load_dflash_pair, dflash_generate
+
+target, tok, drafter, cfg = load_dflash_pair("gemma4")          # drafter bound to the target's head
+res = dflash_generate(target, tok, drafter, "Write a binary search in Python.")  # max_draft_tokens=None = full 16-block
 print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
@@ -169,24 +189,73 @@ block is drafted:
 - **DSpark** — semi-autoregressive: the **DFlash backbone + a cheap rank-256 Markov head** that
   injects token-to-token dependency, fixing suffix decay at ~0.6 ms/round. A strict upgrade of DFlash.
 
-Per the paper (accepted length, full block, temp=1.0), DSpark beats DFlash by **+16–18%** and EAGLE3
-by **+27–31%**. DFlash and EAGLE3 are already in `mlx-vlm` for Gemma-4; **this is the first MLX port
-of DSpark.**
+Per the paper (accepted length, full block, temp=1.0), DSpark beats the DeepSpec DFlash by **+16–18%**
+and EAGLE3 by **+27–31%**. DFlash and EAGLE3 are already in `mlx-vlm` for Gemma-4; **this is the first
+MLX port of DSpark** — and it also runs **z-lab's original DFlash** drafters (see below).
 
-Measured here (greedy, same Mac, DSpark vs DFlash — `dflash_*_block7` is the same architecture with
-`markov_rank=0`, so this repo runs it as-is):
+### Run z-lab's original DFlash too (`--mode dflash`)
 
-| | cap=2 (M-series optimum) | longer block (cap 3–4) |
-|---|---|---|
-| qwen3 chat | tied (~71 tok/s) | DSpark **+16–18%** accept |
-| gemma4 chat | tied (~28 tok/s) | DSpark **+10–11%** accept |
-| code / math | tied | tied (DFlash's parallel draft is already strong on predictable text) |
+The DSpark loader already runs DeepSpec's `dflash_*_block7` as-is (same `*DSparkModel` arch with
+`markov_rank=0`). But [z-lab](https://github.com/z-lab/dflash)'s **original DFlash** (Chen et al.,
+[arXiv:2602.06036](https://arxiv.org/abs/2602.06036), MIT) is a different design: **block diffusion** —
+a Qwen3-style backbone that **reuses the target's embed/lm-head** and denoises a whole **block of 16**
+mask tokens in one parallel pass. mlx-dspark now loads those published checkpoints natively and runs
+them through the same lossless verify loop, so you can benchmark the two head-to-head on one target/Mac:
 
-So the Markov head's advantage reproduces on-device — but mainly on **open-ended chat** and at
-**longer blocks**. At the cap≈2 that Apple Silicon's verify cost forces, DSpark and DFlash run
-effectively tied; DSpark is never worse (accept ≥ DFlash at negligible cost), it just needs the cheap
-verify of GPU batched serving to separate. (The paper's larger gaps are temp=1.0 over full benchmark
-suites; greedy single-prompt narrows them.)
+```bash
+python -m mlx_dspark --mode dflash --max-draft 0 --prompt "..."                  # gemma4, full 16-block (its sweet spot)
+python -m mlx_dspark --mode dflash --family qwen3 --max-draft 0 --prompt "..."   # Qwen3-4B DFlash
+python -m mlx_dspark --mode dflash --max-draft 0 --temperature 1.0 --prompt "..."  # lossless sampling
+```
+
+Built-in presets: `gemma4` (`z-lab/gemma4-12B-it-DFlash`) and `qwen3` (`z-lab/Qwen3-4B-DFlash-b16`).
+Greedy by default; `--temperature > 0` switches to lossless speculative sampling (exact sample from
+target@T). For any *other* z-lab adapter, see [Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter).
+
+**Head-to-head, measured on-device** (gemma-4-12B-it-8bit, M4 Pro, warm, greedy/lossless, 4 prompts/domain
+— accepted length / tok·s; greedy baseline ≈ 17.3 tok/s):
+
+| method | chat | code | math |
+|---|---|---|---|
+| **DSpark** (cap 2) | **2.45 / 28.5** | 2.78 / 32.8 | 2.86 / 32.4 |
+| z-lab **DFlash** (cap 2) | 2.15 / 24.2 | 2.76 / 31.3 | 2.71 / 29.6 |
+| z-lab **DFlash** (full 16) | 2.68 / 16.9 | **5.95 / 36.6** | **6.20 / 36.3** |
+
+The two are **complementary**, and it lines up with the paper's framing:
+
+- **DFlash's block-16 wins structured content on both axes** — accepted length ~**6.0** on code/math
+  (DSpark's block-7 tops out ~2.8) *and* ~**2.1×** throughput, because high acceptance amortizes the
+  16-wide verify.
+- **DSpark wins open chat** — its rank-256 Markov head fixes suffix decay, so chat accepts 2.45 at
+  **1.65×**; DFlash's block never fills on unpredictable text (full-16 chat is ~0.98×, a slight *loss*).
+- On a single-user Mac the long block only converts to wall-clock when acceptance is high (verify cost
+  grows per token here) — DFlash's design target is the cheap-verify **batched-serving** regime.
+
+DFlash is greedy-lossless to the same standard as DSpark (it diverges from sequential greedy only at the
+same fp-margin≈0 ties). On **Qwen3-4B** DFlash also runs (full-block accept ~3.3 on code) but the speedup
+is smaller — Qwen3-4B's cheap verify leaves little to amortize, the same reason DSpark is only ~1.4× there.
+
+### Run any z-lab DFlash adapter
+
+The presets cover `gemma4` + `qwen3`, but **every** z-lab DFlash checkpoint shares this architecture and
+loads the same way — point `load_dflash` at the drafter repo and `load_target` at its matched instruct
+target (z-lab names them to match, e.g. `Qwen3-8B-DFlash-b16` ↔ `Qwen3-8B`), then `bind`:
+
+```python
+from mlx_dspark import load_target, load_dflash, dflash_generate
+
+target, tok  = load_target("mlx-community/Qwen3-8B-8bit")    # the matched instruct target
+drafter, cfg = load_dflash("z-lab/Qwen3-8B-DFlash-b16")      # any z-lab DFlash repo (downloads on first use)
+drafter.bind(target.model)                                   # DFlash reuses the target's embed + lm-head
+res = dflash_generate(target, tok, drafter, "Explain quicksort.", max_draft_tokens=None)  # None = full block
+print(res.text, res.mean_accept_len, res.tokens_per_sec)
+```
+
+The only requirement is a target whose hidden size matches the drafter's (the drafter has no embed/lm-head
+of its own — it reuses the target's). Validated on dense **Gemma-4** and **Qwen3** targets (sliding-window
+attention + tied/untied heads handled). z-lab also ships MoE / linear-attention variants (`Qwen3.5-*`,
+`gpt-oss-*`, …) — those targets use a gated-delta KV rollback this port doesn't wire yet, so they may need
+extra cache handling; PRs welcome.
 
 ## License
 

@@ -13,10 +13,33 @@ their respective licenses):
   - deepseek-ai/dspark_gemma4_12b_block7
   - deepseek-ai/dspark_qwen3_4b_block7
 
-The drafter architecture, training, and checkpoints are the work of DeepSeek and
-the DeepSpec authors. This repository reimplements only the forward/verification
-path for MLX and contains no DeepSpec source code. Target models (Gemma-4, Qwen3)
-are downloaded at runtime from their respective publishers and are subject to
-their own licenses (e.g. the Gemma Terms of Use and the Qwen license).
+The DSpark drafter architecture, training, and checkpoints are the work of DeepSeek
+and the DeepSpec authors. This repository reimplements only the DSpark forward/
+verification path for MLX and contains no DeepSpec source code.
+
+---
+
+DFlash (z-lab)
+--------------
+
+mlx-dspark also runs z-lab's original DFlash drafter (block diffusion for speculative
+decoding):
+
+  - DFlash: https://github.com/z-lab/dflash  (MIT License)
+  - Paper:  Chen et al., "DFlash: Block Diffusion for Flash Speculative Decoding",
+            arXiv:2602.06036
+
+The file `src/mlx_dspark/dflash_model.py` contains the DFlash drafter *model* classes
+(DFlashConfig, DFlashAttention, DFlashDecoderLayer, DFlashDraftModel) vendored verbatim
+from z-lab/dflash (`dflash/model_mlx.py`) under the MIT License; copyright (c) z-lab.
+The MIT permission notice is reproduced in that file's header. The generation/
+verification loop around it (`generate.dflash_generate`) is mlx-dspark's own. DFlash
+checkpoints (e.g. `z-lab/gemma4-12B-it-DFlash`) are downloaded at runtime from z-lab.
+
+---
+
+Target models (Gemma-4, Qwen3) are downloaded at runtime from their respective
+publishers and are subject to their own licenses (e.g. the Gemma Terms of Use and the
+Qwen license).
 
 No model weights are bundled with this package.

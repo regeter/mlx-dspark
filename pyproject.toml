@@ -1,12 +1,12 @@
 [project]
 name = "mlx-dspark"
-version = "0.0.2"
-description = "DSpark speculative decoding (semi-autoregressive drafting) for Apple Silicon via MLX"
+version = "0.0.3"
+description = "DSpark + DFlash speculative decoding (semi-autoregressive / block-diffusion drafting) for Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "erahim3", email = "erahim3@gmail.com" }]
-keywords = ["mlx", "apple-silicon", "speculative-decoding", "dspark", "deepspec", "llm-inference"]
+keywords = ["mlx", "apple-silicon", "speculative-decoding", "dspark", "dflash", "deepspec", "z-lab", "llm-inference"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

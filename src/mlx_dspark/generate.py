@@ -156,6 +156,135 @@ def greedy_generate(
     )
 
 
+def dflash_generate(
+    target_model,
+    tokenizer,
+    drafter,
+    prompt: str,
+    *,
+    max_new_tokens: int = 128,
+    max_draft_tokens: int | None = None,
+    temperature: float = 0.0,
+    apply_chat_template: bool = True,
+    seed: int | None = None,
+    on_text=None,
+) -> GenResult:
+    """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
+
+    DFlash differs from DSpark in two ways that matter to this loop:
+      - it feeds ``[anchor] + (block-1) masks`` and reads logits at the **mask** positions
+        (``logits_start=1``), i.e. predict-the-masks, not DSpark's anchor-as-position-0;
+      - it has no own embed/lm_head — it reuses the target's (we ``bind`` once here).
+
+    ``temperature == 0`` → greedy (exact argmax-match verify; output == greedy decoding up to
+    fp ties). ``temperature > 0`` → speculative sampling (paper §2.1): drafts sampled from the
+    block-diffusion proposal q, accepted w.p. ``min(1, p/q)`` vs the target p, residual-resampled
+    on first reject — an exact sample from the target at temperature T (lossless).
+
+    The backbone always drafts the full block width (it's trained at that width / block
+    diffusion is bidirectional); ``max_draft_tokens`` only bounds how many drafted tokens
+    are *verified* per round. ``None`` = verify the whole block (DFlash's native operating
+    point — best on structured content; on open chat a short cap is faster).
+    """
+    if seed is not None:
+        mx.random.seed(seed)
+    if getattr(drafter, "embed_tokens", None) is None:
+        drafter.bind(target_model.model)
+
+    cfg = drafter.config
+    tap = list(cfg.target_layer_ids)
+    bs = int(cfg.block_size)
+    mask_id = int(cfg.mask_token_id)
+    kdraft = bs - 1
+    cap = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
+    eos_ids = eos_token_ids(tokenizer)
+
+    ids = encode_prompt(tokenizer, prompt, use_chat=apply_chat_template)
+    cache = _make_target_cache(target_model)
+    dcache = drafter.make_cache()                      # persistent draft ctx cache
+    t0 = time.time()
+
+    # prefill
+    logits, fused = _run_target(target_model, mx.array([ids]), cache, tap)
+    pending_ctx = fused                                # fused hidden appended to draft ctx next round
+    pending = _pick(logits[0, -1], temperature)
+    out_ids: list[int] = [pending]
+    accept_lengths: list[int] = []
+    target_forwards = 1
+    streamed = 0
+
+    def _stream():
+        nonlocal streamed
+        if on_text is None:
+            return
+        disp = [t for t in out_ids if t not in eos_ids]
+        full = tokenizer.decode(disp)
+        if len(full) > streamed:
+            on_text(full[streamed:])
+            streamed = len(full)
+
+    _stream()
+    while len(out_ids) < max_new_tokens and pending not in eos_ids:
+        # ---- draft full-width block; feeding pending_ctx appends exactly the just-
+        # committed positions to the draft KV cache (DFlash caches only ctx KV, never
+        # block KV) -> correct absolute RoPE offsets, no trim needed.
+        block = mx.array([[pending] + [mask_id] * (bs - 1)])
+        head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]  # [cap, V] mask logits
+        if temperature > 0.0:
+            q_probs = mx.softmax(head / temperature, axis=-1)
+            draft_arr = mx.random.categorical(head / temperature)
+            mx.eval(draft_arr, q_probs)
+        else:
+            draft_arr = mx.argmax(head, axis=-1)
+            mx.eval(draft_arr)
+            q_probs = None
+        drafted = [int(x) for x in draft_arr.tolist()]
+
+        # ---- verify ----
+        verify_ids = mx.array([[pending] + drafted])
+        v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+        mx.eval(v_logits, v_fused)
+        target_forwards += 1
+
+        if temperature > 0.0:
+            n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature)
+            committed = drafted[:n] + [repl]             # accepted prefix + residual/bonus
+        else:
+            tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
+            n = 0
+            while n < len(drafted) and drafted[n] == tt[n]:
+                n += 1
+            committed = drafted[:n] + [tt[n]]            # accepted prefix + bonus
+        accept_lengths.append(len(committed))
+
+        # ---- update target cache + draft ctx ----
+        trim = len(drafted) - n
+        if trim > 0:
+            for c in cache:
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(trim)
+        pending_ctx = v_fused[:, : n + 1, :]             # [anchor, accepted] -> next draft ctx
+
+        for tok in committed:
+            out_ids.append(tok)
+            if tok in eos_ids:
+                break
+        pending = committed[-1]
+        _stream()
+
+    secs = time.time() - t0
+    disp = [t for t in out_ids if t not in eos_ids]
+    return GenResult(
+        text=tokenizer.decode(disp),
+        token_ids=out_ids,
+        num_tokens=len(out_ids),
+        num_rounds=len(accept_lengths),
+        accept_lengths=accept_lengths,
+        target_forwards=target_forwards,
+        seconds=secs,
+    )
+
+
 def _make_target_cache(target):
     return target.make_cache()
 
