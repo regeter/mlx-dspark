@@ -1,11 +1,30 @@
-# mlx-dspark
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/mlx-dspark.png" alt="mlx-dspark" width="440">
+</p>
 
-**DSpark speculative decoding for Apple Silicon**, built on [MLX](https://github.com/ml-explore/mlx).
+<p align="center">
+  <b>DeepSeek's DSpark speculative decoding — running natively on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
+  <br>A lossless drafter that makes Gemma-4 12B and Qwen3-4B faster on a Mac — <b>~1.6× / ~1.4×</b>, same output.
+</p>
 
-DSpark is DeepSeek's semi-autoregressive, EAGLE-family speculative-decoding drafter,
-open-sourced in the [DeepSpec](https://github.com/deepseek-ai/DeepSpec) codebase and used to
-accelerate DeepSeek-V4. This project ports the **inference path** to MLX so the published
-drafter checkpoints run natively on a Mac.
+<p align="center">
+  <a href="https://pypi.org/project/mlx-dspark/"><img src="https://img.shields.io/pypi/v/mlx-dspark?color=2563eb" alt="PyPI"></a>
+  <img src="https://img.shields.io/pypi/pyversions/mlx-dspark" alt="Python">
+  <img src="https://img.shields.io/badge/platform-Apple%20Silicon-111111?logo=apple&logoColor=white" alt="Apple Silicon">
+  <a href="https://github.com/ARahim3/mlx-dspark/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+</p>
+
+<!-- HOOK: drop the two-terminal comparison gif (baseline vs dspark) here — the single biggest engagement lever.
+     <p align="center"><img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" width="760"></p> -->
+
+```bash
+pip install mlx-dspark
+```
+
+DSpark is DeepSeek's semi-autoregressive, EAGLE-family speculative-decoding drafter, open-sourced in
+the [DeepSpec](https://github.com/deepseek-ai/DeepSpec) codebase and used to accelerate DeepSeek-V4.
+This ports the **inference path** to MLX so the published drafter checkpoints run natively on a Mac —
+**losslessly** (the target verifies every token, so output is identical to normal decoding).
 
 **Supported families** (auto-detected from the drafter config):
 
@@ -34,7 +53,7 @@ pip install mlx-dspark          # or:  uv pip install mlx-dspark
 ```
 
 Apple Silicon + Python ≥ 3.10. Model weights download from the Hugging Face cache on first use
-(none bundled). [![PyPI](https://img.shields.io/pypi/v/mlx-dspark)](https://pypi.org/project/mlx-dspark/)
+(none bundled).
 
 From source (dev):
 
@@ -67,25 +86,28 @@ res = speculative_generate(target, tok, drafter, "Explain how rainbows form.")
 print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
-## Results (M4 Pro, 48 GB; 8-bit instruct target, 4-bit drafter; warm, cap=2 — `python benchmark.py`)
+## Results (M4 Pro, warm; 8-bit instruct target, 4-bit drafter, cap=2)
 
-| family | drafter `d_0` | accept len | greedy (baseline) | dspark (this project) | speedup |
+Speedup is vs the **official MLX tools** running the same model (`mlx_lm.generate` / `mlx_vlm.generate`):
+
+| family | drafter `d_0` | accept len | baseline (official) | mlx-dspark | speedup |
 |---|---|---|---|---|---|
-| **Gemma-4 12B** | ~82% | ~2.5 | ~17.5 tok/s | ~30 tok/s | **~1.73×** |
-| **Qwen3-4B**    | ~85% | ~2.25 | ~49.8 tok/s | ~73 tok/s | **~1.45×** |
+| **Gemma-4 12B** | ~82% | ~2.5 | 18.4 tok/s | ~30 tok/s | **~1.6×** (≤2× on code/math) |
+| **Qwen3-4B**    | ~85% | ~2.25 | 52.9 tok/s | ~73 tok/s | **~1.4×** |
 
-"greedy" = the plain target model decoding one token per forward (no drafter); "dspark" =
-speculative decoding with the DSpark drafter. Both produce **identical** output — DSpark is just
-faster (it diverges from sequential greedy only at logit-margin≈0 ties).
+Both produce **identical** output — DSpark is just faster (it diverges from sequential greedy only
+at logit-margin≈0 ties). (`python benchmark.py`'s in-harness greedy baseline is ~5% slower than the
+official tools, so it shows a slightly higher ~1.73× / ~1.45× — we quote the conservative number.)
 
 ### What to expect on Apple Silicon (the speedup ceiling)
 
 **These numbers are in line with the DSpark paper.** The paper's headline is **60–85% (V4-Flash)
 / 57–78% (V4-Pro) per-user speedup = ~1.57–1.85×**, measured in *batched production serving vs an
 MTP-1 baseline* (where the confidence scheduler's job is avoiding batch-capacity waste). Our
-~1.45–1.73× *single-user vs plain greedy* sits right in that band. The "2–4×" you may have seen
-elsewhere comes from other speculative-decoding papers on datacenter GPUs with greedy baselines,
-not from DSpark's own claims.
+~1.4–1.6× *single-user vs the official tools* sits in/near that band — Gemma-4 12B lands inside it;
+the smaller Qwen3-4B is a touch below because its cheaper verify leaves less to amortize. The "2–4×"
+you may have seen elsewhere comes from other speculative-decoding papers on datacenter GPUs with
+greedy baselines, not from DSpark's own claims.
 
 Why it can't go much higher here: speculative decoding amortizes a *memory-bound* single-token
 decode across the K tokens verified in one forward. On a datacenter GPU that arbitrage is huge
