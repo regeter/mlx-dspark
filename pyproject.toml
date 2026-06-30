@@ -1,6 +1,6 @@
 [project]
 name = "mlx-dspark"
-version = "0.0.1"
+version = "0.0.2"
 description = "DSpark speculative decoding (semi-autoregressive drafting) for Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -30,9 +30,18 @@ The drafter is loaded 1:1 from the HF checkpoint and **quantized to 4-bit** by d
 ## Install
 
 ```bash
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install -e .
+pip install mlx-dspark          # or:  uv pip install mlx-dspark
+```
+
+Apple Silicon + Python ≥ 3.10. Model weights download from the Hugging Face cache on first use
+(none bundled). [![PyPI](https://img.shields.io/pypi/v/mlx-dspark)](https://pypi.org/project/mlx-dspark/)
+
+From source (dev):
+
+```bash
+git clone https://github.com/ARahim3/mlx-dspark && cd mlx-dspark
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install -e ".[dev]"
 ```
 
 ## Use
@@ -45,6 +54,9 @@ python -m mlx_dspark --family gemma4 --prompt "Explain how rainbows form." --max
 # side-by-side demo: baseline (plain target) vs dspark (record each, stack)
 python -m mlx_dspark --family qwen3 --mode baseline --prompt "..." --max-new-tokens 400
 python -m mlx_dspark --family qwen3 --mode dspark   --prompt "..." --max-new-tokens 400
+
+# sampled (not greedy) — lossless wrt the target at temperature T (paper's method)
+python -m mlx_dspark --family qwen3 --prompt "Write a short poem." --temperature 1.0 --seed 0
 ```
 
 ```python
@@ -55,31 +67,103 @@ res = speculative_generate(target, tok, drafter, "Explain how rainbows form.")
 print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
-## Results (M4 Pro, 48 GB; 8-bit instruct target, 4-bit drafter; warm — `python benchmark.py`)
+## Results (M4 Pro, 48 GB; 8-bit instruct target, 4-bit drafter; warm, cap=2 — `python benchmark.py`)
 
 | family | drafter `d_0` | accept len | greedy (baseline) | dspark (this project) | speedup |
 |---|---|---|---|---|---|
-| **Gemma-4 12B** | ~82% | 2.5–3.6 | ~17 tok/s | ~28 tok/s | **~1.5–1.6×** |
-| **Qwen3-4B**    | ~85% | 2.1–2.8 | ~49 tok/s | ~66 tok/s | **~1.3–1.4×** |
+| **Gemma-4 12B** | ~82% | ~2.5 | ~17.5 tok/s | ~30 tok/s | **~1.73×** |
+| **Qwen3-4B**    | ~85% | ~2.25 | ~49.8 tok/s | ~73 tok/s | **~1.45×** |
 
 "greedy" = the plain target model decoding one token per forward (no drafter); "dspark" =
 speculative decoding with the DSpark drafter. Both produce **identical** output — DSpark is just
-faster (it diverges from sequential greedy only at logit-margin≈0 ties). Smaller/faster targets (Qwen3-4B) have a lower
-per-token verify cost, so the optimal `--max-draft` is smaller (~2).
+faster (it diverges from sequential greedy only at logit-margin≈0 ties).
+
+### What to expect on Apple Silicon (the speedup ceiling)
+
+**These numbers are in line with the DSpark paper.** The paper's headline is **60–85% (V4-Flash)
+/ 57–78% (V4-Pro) per-user speedup = ~1.57–1.85×**, measured in *batched production serving vs an
+MTP-1 baseline* (where the confidence scheduler's job is avoiding batch-capacity waste). Our
+~1.45–1.73× *single-user vs plain greedy* sits right in that band. The "2–4×" you may have seen
+elsewhere comes from other speculative-decoding papers on datacenter GPUs with greedy baselines,
+not from DSpark's own claims.
+
+Why it can't go much higher here: speculative decoding amortizes a *memory-bound* single-token
+decode across the K tokens verified in one forward. On a datacenter GPU that arbitrage is huge
+(parallel verify is nearly free, so speedup ≈ acceptance length). On an M-series chip it is much
+weaker — verify cost **grows with the number of tokens** (measured ≈ +14 ms/token for Gemma-4 12B,
++1.5 ms/token for Qwen3-4B; multi-token verify drops out of the fast quantized GEMV path). With the
+cost model `tok/s ≈ A / (drafter + 0.035 + slope·C)`, even a *perfect* drafter accepting the whole
+7-token block tops out around **~2.2×** here. The binding limiter is acceptance length, set by the
+drafter↔target match — **not** drafter quantization (4/8-bit/bf16 drafter all give identical
+acceptance; 4-bit is simply fastest).
+
+**Greedy vs sampling.** The default (`temperature 0`) is greedy: exact argmax-match verification,
+output byte-identical to greedy decoding. `--temperature > 0` switches to the paper's actual method
+(§2.1) — **speculative sampling**: draft tokens are sampled and accepted with prob `min(1, p/q)`,
+rejections resample from the residual `norm(max(0, p−q))`, so the output is an **exact sample from
+the target at temperature T** (lossless). It accepts a bit more per round (greedy's exact-match is
+the strictest rule), but on M-series the verify cost still keeps cap≈2 optimal, where that extra
+acceptance lives mostly in the unreached tail — so net speed is ≈ the greedy ratio. Use it when you
+want *sampled* output, not for extra speed.
 
 ### Target choice matters
 
-The drafter is trained against a specific **instruct** model in **bf16** — use the matching
-instruct target (`gemma-4-12B-it` / `Qwen3-4B`), not the base model (base gave `d_0` ~47% vs
-82%). Higher precision raises acceptance; 8-bit is the sweet spot. `-bf16` maximizes acceptance;
-4-bit verifies faster.
+The drafter is trained against a specific **instruct** model — use the matching instruct target
+(`gemma-4-12B-it` / `Qwen3-4B`), not the base model (base gave `d_0` ~47% vs 82%). Higher target
+precision raises acceptance a little; **a bf16 target is *not* a speed win on M-series** — verify
+dominates and roughly doubles, outpacing the small acceptance gain.
+
+Target precision is a speed/quality knob. Since verify dominates, a **4-bit target** gives the
+**highest absolute throughput** (and fits ≤24 GB Macs) — but the spec *ratio* shrinks (cheap verify
+= less to amortize) and it's a lower-quality model:
+
+| family | 8-bit target (default) | 4-bit target |
+|---|---|---|
+| gemma4 | greedy 17.5 → spec 30 tok/s (**1.73×**) | greedy 30.6 → spec 34–38 tok/s (1.1–1.25×) |
+| qwen3  | greedy 49.8 → spec 73 tok/s (**1.45×**) | greedy 82 → spec 96–103 tok/s (1.17–1.26×) |
+
+So: **8-bit for the biggest spec benefit + best quality; 4-bit for max absolute speed or small RAM**
+(`--target mlx-community/gemma-4-12B-it-4bit`). Drafter stays 4-bit either way.
 
 ### Tuning
 
-On Apple Silicon the target verify cost grows with the number of tokens verified, so the
-optimum is to verify ~= the acceptance length: `--max-draft 4` (default). `--max-draft <block>`
-(full 7) is faithful but *slower* on M-series. `--confidence-threshold 0.6` instead truncates
-the block adaptively via the drafter's confidence head.
+The target verify cost grows per token *and* the marginal draft token rarely survives, so the
+measured optimum for both families is **`--max-draft 2` (default)** — higher caps verify more
+tokens for little extra acceptance and are slower. The drafter only runs its lm_head + Markov head
+over these `cap` positions (the backbone stays full-width for faithful bidirectional block
+attention). `--max-draft <block>` (full 7) is faithful but *slower*. `--confidence-threshold 0.6`
+instead truncates the block adaptively via the drafter's confidence head.
+
+## DSpark vs DFlash / EAGLE3
+
+These are **three drafters from the same DeepSpec codebase**, all EAGLE-family (a tiny drafter that
+consumes the *target's hidden states*, not a standalone draft LLM). They differ only in how the
+block is drafted:
+
+- **EAGLE3** — autoregressive (token-by-token): high quality but draft latency grows with block size.
+- **DFlash** — parallel (whole block in one pass): fast, but **suffix decay** (later positions are
+  predicted independently and collide).
+- **DSpark** — semi-autoregressive: the **DFlash backbone + a cheap rank-256 Markov head** that
+  injects token-to-token dependency, fixing suffix decay at ~0.6 ms/round. A strict upgrade of DFlash.
+
+Per the paper (accepted length, full block, temp=1.0), DSpark beats DFlash by **+16–18%** and EAGLE3
+by **+27–31%**. DFlash and EAGLE3 are already in `mlx-vlm` for Gemma-4; **this is the first MLX port
+of DSpark.**
+
+Measured here (greedy, same Mac, DSpark vs DFlash — `dflash_*_block7` is the same architecture with
+`markov_rank=0`, so this repo runs it as-is):
+
+| | cap=2 (M-series optimum) | longer block (cap 3–4) |
+|---|---|---|
+| qwen3 chat | tied (~71 tok/s) | DSpark **+16–18%** accept |
+| gemma4 chat | tied (~28 tok/s) | DSpark **+10–11%** accept |
+| code / math | tied | tied (DFlash's parallel draft is already strong on predictable text) |
+
+So the Markov head's advantage reproduces on-device — but mainly on **open-ended chat** and at
+**longer blocks**. At the cap≈2 that Apple Silicon's verify cost forces, DSpark and DFlash run
+effectively tied; DSpark is never worse (accept ≥ DFlash at negligible cost), it just needs the cheap
+verify of GPU batched serving to separate. (The paper's larger gaps are temp=1.0 over full benchmark
+suites; greedy single-prompt narrows them.)
 
 ## License
 

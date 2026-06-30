@@ -93,24 +93,36 @@ def eos_token_ids(tokenizer) -> set[int]:
     return ids
 
 
+def _pick(logits_row, temperature: float) -> int:
+    """argmax (temperature 0) or a temperature sample (temperature > 0)."""
+    if temperature > 0.0:
+        return int(mx.random.categorical(logits_row / temperature).item())
+    return int(mx.argmax(logits_row).item())
+
+
 def greedy_generate(
     target_model,
     tokenizer,
     prompt: str,
     *,
     max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    seed: int | None = None,
     apply_chat_template: bool = True,
     on_text=None,
 ) -> GenResult:
-    """Plain greedy decoding of the target (no drafter, no hidden-state capture) —
-    the fair 'run the model normally' baseline. Streams via on_text."""
+    """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
+    'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
+    the spec path so a temp>0 A/B compares like-for-like). Streams via on_text."""
+    if seed is not None:
+        mx.random.seed(seed)
     eos_ids = eos_token_ids(tokenizer)
     ids = encode_prompt(tokenizer, prompt, use_chat=apply_chat_template)
     cache = target_model.make_cache()
 
     t0 = time.time()
     logits = target_model.plain(mx.array([ids]), cache)
-    nxt = int(mx.argmax(logits[0, -1]).item())
+    nxt = _pick(logits[0, -1], temperature)
     out_ids = [nxt]
     streamed = 0
 
@@ -127,7 +139,7 @@ def greedy_generate(
     _stream()
     while len(out_ids) < max_new_tokens and nxt not in eos_ids:
         logits = target_model.plain(mx.array([[nxt]]), cache)
-        nxt = int(mx.argmax(logits[0, -1]).item())
+        nxt = _pick(logits[0, -1], temperature)
         out_ids.append(nxt)
         _stream()
 
@@ -153,6 +165,38 @@ def _run_target(target, ids: mx.array, cache, tap: list[int]):
     return target.run(ids, cache, tap)
 
 
+def _spec_sample_accept(v_logits, draft, q_probs, temperature):
+    """Speculative-sampling acceptance (Leviathan/Chen 2023) for one verified block.
+
+    ``v_logits`` [1+L, V] are the target logits at the verify positions; ``draft`` is the
+    list of L sampled tokens; ``q_probs`` [>=L, V] the draft distributions they were sampled
+    from. Each token is accepted w.p. ``min(1, p(x)/q(x))``; the first rejection stops the
+    block and resamples from the residual ``norm(max(0, p-q))``; if all accept, a bonus is
+    sampled from the target. Returns ``(n_accepted, replacement_token)``. This is the rule
+    that makes the output an exact sample from the target's temperature-T distribution."""
+    L = len(draft)
+    p = mx.softmax(v_logits / temperature, axis=-1)            # [1+L, V]
+    rows = mx.arange(L)
+    idx = mx.array(draft)
+    pd = p[rows, idx]                                          # target prob of each drafted token
+    qd = q_probs[rows, idx]                                    # draft prob it was sampled from
+    u = mx.random.uniform(shape=(L,))
+    accepted = u < mx.minimum(1.0, pd / mx.maximum(qd, 1e-9))
+    mx.eval(accepted)
+    n = 0
+    for a in accepted.tolist():
+        if not a:
+            break
+        n += 1
+    if n < L:
+        resid = mx.maximum(p[n] - q_probs[n], 0.0)            # residual at the rejected position
+        resid = resid / mx.maximum(resid.sum(), 1e-9)
+        repl = int(mx.random.categorical(mx.log(resid + 1e-20)).item())
+    else:
+        repl = int(mx.random.categorical(v_logits[L] / temperature).item())  # target bonus
+    return n, repl
+
+
 def speculative_generate(
     target_model,
     tokenizer,
@@ -161,17 +205,34 @@ def speculative_generate(
     *,
     max_new_tokens: int = 128,
     confidence_threshold: float = 0.0,
-    max_draft_tokens: int | None = 4,
+    max_draft_tokens: int | None = 2,
+    temperature: float = 0.0,
+    seed: int | None = None,
     apply_chat_template: bool = True,
     on_text=None,
     verbose: bool = False,
 ) -> GenResult:
-    """Greedy speculative decoding. Output is target-greedy by construction (up to
-    fp tie-breaking on near-ties). ``max_draft_tokens`` caps how many of the 7-token
-    block are verified per round; on Apple Silicon the target verify cost grows with
-    tokens, so the optimum is ~= acceptance length (default 4). ``None`` = full block
-    (faithful but slower on M-series). ``confidence_threshold`` > 0 instead truncates
-    the block adaptively using the drafter's confidence head."""
+    """Speculative decoding (batch=1).
+
+    ``temperature == 0`` → **greedy**: argmax draft, exact-argmax-match verify. Output is
+    target-greedy by construction (up to fp tie-breaking on near-ties).
+
+    ``temperature > 0`` → **speculative sampling** (the paper's setup, §2.1): each draft
+    position is sampled from its temperature-scaled distribution q, then accepted with
+    probability ``min(1, p(x)/q(x))`` against the target distribution p; on the first
+    rejection the token is resampled from the residual ``norm(max(0, p-q))`` and the rest
+    of the block is discarded; if all are accepted a bonus is sampled from the target. This
+    preserves the target's temperature-T sampling distribution exactly (lossless), and
+    accepts more per round than greedy (greedy's exact-match is the strictest possible rule).
+
+    ``max_draft_tokens`` (``cap``) bounds how many of the 7-token block are drafted *and*
+    verified per round: on Apple Silicon the verify cost grows with tokens and the marginal
+    draft token rarely survives, so cap=2 is the measured optimum (the drafter only runs
+    lm_head/markov over these ``cap`` positions). ``None`` = full block. ``confidence_threshold``
+    > 0 truncates the block adaptively via the drafter's confidence head (cumulative survival).
+    """
+    if seed is not None:
+        mx.random.seed(seed)
     cfg = drafter.config
     tap = list(cfg.target_layer_ids)
     k = cfg.block_size
@@ -192,7 +253,10 @@ def speculative_generate(
     logits, fused = _run_target(target_model, prompt_ids, cache, tap)
     n_cached = prompt_ids.shape[1]
     drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx_caches)
-    pending = int(mx.argmax(logits[0, -1]).item())  # first committed token
+    if temperature > 0.0:
+        pending = int(mx.random.categorical(logits[0, -1] / temperature).item())
+    else:
+        pending = int(mx.argmax(logits[0, -1]).item())  # first committed token
     mx.eval([c.k for c in ctx_caches])
 
     out_ids: list[int] = [pending]
@@ -213,41 +277,61 @@ def speculative_generate(
     _stream()
     while len(out_ids) < max_new_tokens and pending not in eos_ids:
         # ---- 1. draft a block ----
+        # The backbone runs full-width: block attention is bidirectional, so each
+        # position's hidden depends on the whole block, and shrinking it would change
+        # the distribution the drafter was trained on. But we only ever *verify* `cap`
+        # tokens, so run the lm_head and the sequential markov head over just the first
+        # `cap` positions instead of all `k` — the rest used to be computed and thrown
+        # away every round (the dominant slice of drafter time at small caps).
         block_ids = [pending] + [mask_id] * (k - 1)
         noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
         block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
-        base_logits = drafter.compute_logits(block_hidden)[0]   # [k, V]
-        draft = drafter.sample_block(base_logits, first_prev_token=pending)
-        mx.eval(draft)
-        draft = [int(x) for x in draft.tolist()]
+        head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
+        base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
+        if temperature > 0.0:
+            draft_arr, q_probs = drafter.sample_block_probs(base_logits, pending, temperature)
+            mx.eval(draft_arr, q_probs)
+        else:
+            draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
+            mx.eval(draft_arr)
+            q_probs = None
+        draft = [int(x) for x in draft_arr.tolist()]
 
-        # optional confidence-based truncation (adaptive block length)
+        # optional confidence-based truncation (adaptive block length, within cap).
+        # Paper §3.2.1: c_k is the *conditional* survival prob of position k given the
+        # prefix accepted; the prefix survival prob is the cumulative product
+        # a_j = ∏_{i<=j} c_i (Eq 7-8). Keep extending the draft while a_j stays above
+        # the threshold, i.e. while the next token is still likely to survive verify.
         if confidence_threshold > 0.0 and drafter.confidence_head is not None:
             prev_tokens = mx.array([pending] + draft[:-1])
-            conf = mx.sigmoid(drafter.confidence_logits(block_hidden[0], prev_tokens))
+            conf = mx.sigmoid(drafter.confidence_logits(head_hidden[0], prev_tokens))
             mx.eval(conf)
-            below = [i for i, c in enumerate(conf.tolist()) if c < confidence_threshold]
-            if below:
-                draft = draft[: below[0]]
-        if cap < len(draft):
-            draft = draft[:cap]
+            surv, keep = 1.0, 0
+            for i, c in enumerate(conf.tolist()):
+                surv *= c
+                if surv < confidence_threshold:
+                    break
+                keep = i + 1
+            draft = draft[:keep]
         if not draft:
-            draft = [int(mx.argmax(base_logits[0]).item())]  # always propose >=1
+            draft = [int(draft_arr[0].item())]  # always propose >=1 (q_probs[0] still aligns)
 
         # ---- 2. verify with the target ----
         verify_ids = mx.array([[pending] + draft])             # [1, 1+len(draft)]
         v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
         mx.eval(v_logits, v_fused)
         target_forwards += 1
-        tt = mx.argmax(v_logits[0], axis=-1)                   # [1+len(draft)]
-        tt = [int(x) for x in tt.tolist()]
 
-        # ---- 3. accept matching prefix + bonus ----
-        n = 0
-        while n < len(draft) and draft[n] == tt[n]:
-            n += 1
-        bonus = tt[n]                                          # correction / continuation
-        committed = draft[:n] + [bonus]
+        # ---- 3. accept ----
+        if temperature > 0.0:
+            n, repl = _spec_sample_accept(v_logits[0], draft, q_probs, temperature)
+            committed = draft[:n] + [repl]                     # accepted prefix + residual/bonus
+        else:
+            tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
+            n = 0
+            while n < len(draft) and draft[n] == tt[n]:
+                n += 1
+            committed = draft[:n] + [tt[n]]                    # accepted prefix + bonus
         accept_lengths.append(len(committed))
 
         # ---- 4. update caches/context ----

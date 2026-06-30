@@ -55,7 +55,13 @@ def _repeat_kv(x: mx.array, n_rep: int) -> mx.array:
 
 
 class CtxCache:
-    """Per-layer cache of the target context's projected K/V (roped K, normed/raw V)."""
+    """Per-layer cache of the target context's projected K/V (roped K, normed/raw V).
+
+    Append-only (the drafter context only ever grows with *committed* tokens — it is
+    never trimmed/rolled back, unlike the target KV cache). A preallocated growing buffer
+    (mlx-lm KVCache style) was tried to avoid the O(n²) realloc, but measured 0.99× at
+    ≤600 tokens — the realloc is negligible at realistic lengths and the scatter overhead
+    is not. Plain concatenate is simpler and as fast here."""
 
     __slots__ = ("k", "v")
 
@@ -260,6 +266,29 @@ class DSparkDrafter(nn.Module):
             tokens.append(nxt)
             prev = nxt
         return mx.concatenate(tokens)
+
+    def sample_block_probs(self, base_logits: mx.array, first_prev_token: int,
+                           temperature: float) -> tuple[mx.array, mx.array]:
+        """Temperature draft for speculative *sampling*: sample each block position from
+        its (temperature-scaled) distribution and return ``(tokens [k], probs [k, V])``.
+        ``probs[i]`` is the full draft distribution q_i that token i was sampled from —
+        the verifier needs it for the accept test ``min(1, p_i(x_i)/q_i(x_i))`` and for
+        residual resampling on rejection. Sequential because the Markov bias for position
+        i depends on the token sampled at i-1."""
+        k = base_logits.shape[0]
+        inv_t = 1.0 / temperature
+        tokens, probs = [], []
+        prev = mx.array([first_prev_token])
+        for i in range(k):
+            logits = base_logits[i]
+            if self.markov_head is not None:
+                logits = logits + self.markov_head.step_bias(prev)[0]
+            logits = logits * inv_t
+            probs.append(mx.softmax(logits, axis=-1))
+            nxt = mx.random.categorical(logits).reshape(1)
+            tokens.append(nxt)
+            prev = nxt
+        return mx.concatenate(tokens), mx.stack(probs, axis=0)
 
     def confidence_logits(self, block_hidden, prev_token_ids):
         if self.confidence_head is None:

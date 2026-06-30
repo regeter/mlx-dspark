@@ -34,7 +34,10 @@ def main() -> None:
     ap.add_argument("--target", default=None)
     ap.add_argument("--drafter", default=None)
     ap.add_argument("--max-new-tokens", type=int, default=220)
-    ap.add_argument("--max-draft", type=int, default=4)
+    ap.add_argument("--max-draft", type=int, default=2)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy (exact); >0 = speculative sampling (paper setup, lossless wrt target@T)")
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--confidence-threshold", type=float, default=0.0)
     ap.add_argument("--drafter-bits", type=int, default=4)
     ap.add_argument("--no-chat-template", action="store_true")
@@ -62,12 +65,14 @@ def main() -> None:
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=args.max_draft,
             confidence_threshold=args.confidence_threshold,
+            temperature=args.temperature, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
     else:
         res = greedy_generate(
             target, tok, args.prompt, max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = ""
