@@ -6,9 +6,14 @@ build/
 dist/
 .ruff_cache/
 .pytest_cache/
+.DS_Store
 # local model/drafter weights
 checkpoints/
 *.safetensors
+# demo recording working files (the final docs/demo.gif is committed)
+*.mp4
+*.mov
+/overlay.png
 scratch/
 drafts/
 .claude/

@@ -14,8 +14,9 @@
   <a href="https://github.com/ARahim3/mlx-dspark/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
 </p>
 
-<!-- HOOK: drop the two-terminal comparison gif (baseline vs dspark) here — the single biggest engagement lever.
-     <p align="center"><img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" width="760"></p> -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" alt="Baseline vs DSpark — same output, ~1.8x faster on Gemma-4 12B" width="840">
+</p>
 
 ```bash
 pip install mlx-dspark
