@@ -122,6 +122,7 @@ at its `cap=2` optimum:
 | family | drafter `d_0` | accept len | baseline (official) | mlx-dspark | speedup |
 |---|---|---|---|---|---|
 | **Gemma-4 12B** | ~82% | ~2.5 | 18.4 tok/s | ~30 tok/s | **~1.6×** (≤2× on code/math) |
+| **Qwen3-8B**    | –    | ~2.44 | 29.4 tok/s | ~47 tok/s | **~1.6×** |
 | **Qwen3-4B**    | ~85% | ~2.25 | 52.9 tok/s | ~73 tok/s | **~1.4×** |
 
 **DFlash** (z-lab) trades the other way — its block-16 denoise shines on **structured** content. On
@@ -145,8 +146,8 @@ we quote the conservative number.)
 **These numbers are in line with the DSpark paper.** The paper's headline is **60–85% (V4-Flash)
 / 57–78% (V4-Pro) per-user speedup = ~1.57–1.85×**, measured in *batched production serving vs an
 MTP-1 baseline* (where the confidence scheduler's job is avoiding batch-capacity waste). Our
-~1.4–1.6× *single-user vs the official tools* sits in/near that band — Gemma-4 12B lands inside it;
-the smaller Qwen3-4B is a touch below because its cheaper verify leaves less to amortize. The "2–4×"
+~1.4–1.6× *single-user vs the official tools* sits in/near that band — Gemma-4 12B and Qwen3-8B land
+inside it; the smaller Qwen3-4B is a touch below because its cheaper verify leaves less to amortize. The "2–4×"
 you may have seen elsewhere comes from other speculative-decoding papers on datacenter GPUs with
 greedy baselines, not from DSpark's own claims.
 
@@ -257,8 +258,31 @@ The two are **complementary**, and it lines up with the paper's framing:
   grows per token here) — DFlash's design target is the cheap-verify **batched-serving** regime.
 
 DFlash is greedy-lossless to the same standard as DSpark (it diverges from sequential greedy only at the
-same fp-margin≈0 ties). On **Qwen3-4B** DFlash also runs (full-block accept ~3.3 on code) but the speedup
-is smaller — Qwen3-4B's cheap verify leaves little to amortize, the same reason DSpark is only ~1.4× there.
+same fp-margin≈0 ties).
+
+**But the winner is model-dependent, not just content-dependent** — on a *smaller, cheap-verify* target
+the picture flips. Qwen3-8B-8bit (M4 Pro, warm, greedy, 3 prompts/domain, accept / tok·s; greedy ≈ 28.8):
+
+| method | chat | code | math |
+|---|---|---|---|
+| **DSpark** (cap 2) | **2.38 / 45.7** | **2.55 / 48.8** | **2.40 / 46.1** |
+| DFlash (cap 2) | 1.99 / 33.8 | 2.22 / 37.0 | 2.11 / 35.7 |
+| DFlash (full 16) | 2.19 / 21.1 | 2.94 / 27.6 | 2.66 / 25.5 |
+
+Here **DSpark wins everywhere (~1.6×)** and DFlash's full-16 block is a net *loss* (0.86×): Qwen3-8B's
+verify is cheap, so the wide block costs more than it returns and acceptance never climbs (~2.9 on code vs
+5.95 on the 12B). DFlash's block-16 edge needs an *expensive*-verify target — a big model like the 12B, or
+batched GPU serving — to pay off. (Qwen3-4B is the same story, more extreme: verify is even cheaper.) So:
+**bigger / slower-verify target → favor DFlash full-block on code/math; smaller / fast target → DSpark.**
+
+Reproduce these (Qwen3-8B has no preset — point `--drafter`/`--target` at the repos; downloads on first run):
+
+```bash
+python -m mlx_dspark --mode dspark --drafter deepseek-ai/dspark_qwen3_8b_block7 \
+  --target mlx-community/Qwen3-8B-8bit --prompt "Write a binary search in Python."
+python -m mlx_dspark --mode dflash --max-draft 0 --drafter z-lab/Qwen3-8B-DFlash-b16 \
+  --target mlx-community/Qwen3-8B-8bit --prompt "Write a binary search in Python."
+```
 
 ### Run any z-lab DFlash adapter
 
@@ -288,11 +312,11 @@ print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
 The only requirement is a target whose hidden size matches the drafter's (the drafter has no embed/lm-head
-of its own — it reuses the target's). **Scope:** validated on dense **Gemma-4** and **Qwen3** targets
-(Qwen3-4B measured here; Qwen3-8B and the larger Gemma-4 variants share the exact code path — same recipe,
-bigger download). z-lab also ships MoE / linear-attention variants (`Qwen3.5-*`, `gpt-oss-*`, …); those
-targets route differently and use a gated-delta KV rollback this port doesn't wire yet, so they need a bit
-more work — PRs welcome.
+of its own — it reuses the target's). **Scope:** measured on dense **Gemma-4 12B** and **Qwen3 4B / 8B**
+targets — all lossless, no code change (Qwen3-8B is untied embeddings and loads via `bind` exactly the
+same). Larger Gemma-4 variants share the identical code path (just a bigger download). z-lab also ships
+MoE / linear-attention variants (`Qwen3.5-*`, `gpt-oss-*`, …); those targets route differently and use a
+gated-delta KV rollback this port doesn't wire yet, so they need a bit more work — PRs welcome.
 
 ## License
 
