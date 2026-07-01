@@ -25,17 +25,19 @@ used to accelerate DeepSeek-V4) and z-lab's **DFlash** (block diffusion). Both a
 target verifies every token, so output is identical to normal decoding — and run under one verify loop,
 so you can benchmark them head-to-head. `pip install mlx-dspark` (full setup in [Install](#install)).
 
-**Supported families** — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
+**Built-in presets** (`--family`) — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
 
 | family | target (instruct, 8-bit) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | RAM |
 |---|---|---|---|---|
 | `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~32 GB+ |
 | `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~16 GB |
 
-The two drafters have different trade-offs (DSpark's Markov head wins open chat; DFlash's block-16
-wins code/math) — see [DSpark vs DFlash](#dspark-vs-dflash--eagle3) for the head-to-head. **Any other
-z-lab DFlash adapter** (e.g. `Qwen3-8B-DFlash-b16`) runs too — see
-[Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter).
+These are just the *convenience pairings*, not the limit. The DFlash path is a recipe: **any** z-lab
+DFlash checkpoint with a matched dense Qwen3 / Gemma-4 target runs by pointing `--drafter` / `--target`
+at the repos — e.g. `Qwen3-8B-DFlash-b16`, no code change (see
+[Run any z-lab DFlash adapter](#run-any-z-lab-dflash-adapter)). The two drafters have different
+trade-offs (DSpark's Markov head wins open chat; DFlash's block-16 wins code/math) — see
+[DSpark vs DFlash](#dspark-vs-dflash--eagle3) for the head-to-head.
 
 ## How it works
 
@@ -255,9 +257,20 @@ is smaller — Qwen3-4B's cheap verify leaves little to amortize, the same reaso
 
 ### Run any z-lab DFlash adapter
 
-The presets cover `gemma4` + `qwen3`, but **every** z-lab DFlash checkpoint shares this architecture and
-loads the same way — point `load_dflash` at the drafter repo and `load_target` at its matched instruct
-target (z-lab names them to match, e.g. `Qwen3-8B-DFlash-b16` ↔ `Qwen3-8B`), then `bind`:
+The `gemma4` / `qwen3` presets are just convenience pairings — the DFlash path is a **recipe**, not a
+fixed list. Every z-lab DFlash checkpoint shares the same architecture, so any of them runs by pointing
+at the drafter repo + its matched instruct target (z-lab names them to match, e.g. `Qwen3-8B-DFlash-b16`
+↔ `Qwen3-8B`). No preset or code change needed.
+
+**From the CLI** — override `--drafter` / `--target` (the `--family` flag is then ignored):
+
+```bash
+python -m mlx_dspark --mode dflash --max-draft 0 \
+  --drafter z-lab/Qwen3-8B-DFlash-b16 --target mlx-community/Qwen3-8B-8bit \
+  --prompt "Explain quicksort."
+```
+
+**From Python:**
 
 ```python
 from mlx_dspark import load_target, load_dflash, dflash_generate
@@ -270,10 +283,11 @@ print(res.text, res.mean_accept_len, res.tokens_per_sec)
 ```
 
 The only requirement is a target whose hidden size matches the drafter's (the drafter has no embed/lm-head
-of its own — it reuses the target's). Validated on dense **Gemma-4** and **Qwen3** targets (sliding-window
-attention + tied/untied heads handled). z-lab also ships MoE / linear-attention variants (`Qwen3.5-*`,
-`gpt-oss-*`, …) — those targets use a gated-delta KV rollback this port doesn't wire yet, so they may need
-extra cache handling; PRs welcome.
+of its own — it reuses the target's). **Scope:** validated on dense **Gemma-4** and **Qwen3** targets
+(Qwen3-4B measured here; Qwen3-8B and the larger Gemma-4 variants share the exact code path — same recipe,
+bigger download). z-lab also ships MoE / linear-attention variants (`Qwen3.5-*`, `gpt-oss-*`, …); those
+targets route differently and use a gated-delta KV rollback this port doesn't wire yet, so they need a bit
+more work — PRs welcome.
 
 ## License
 
