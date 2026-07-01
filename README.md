@@ -27,10 +27,15 @@ so you can benchmark them head-to-head. `pip install mlx-dspark` (full setup in 
 
 **Built-in presets** (`--family`) — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
 
-| family | target (instruct, 8-bit) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | RAM |
+| family | target (instruct, 8-bit) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | peak RAM |
 |---|---|---|---|---|
-| `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~32 GB+ |
-| `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~16 GB |
+| `gemma4` | `gemma-4-12B-it-8bit` | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
+| `qwen3`  | `Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~8 GB |
+
+*Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache). Add headroom for macOS:
+gemma4 is comfortable on a **24 GB** Mac, qwen3 on **16 GB**. A 4-bit target (`--target …-it-4bit`) roughly
+halves the target's share (gemma4 → ~9 GB, fits 16 GB). The DFlash drafter is even smaller than DSpark's,
+so `--mode dflash` uses slightly less.
 
 These are just the *convenience pairings*, not the limit. The DFlash path is a recipe: **any** z-lab
 DFlash checkpoint with a matched dense Qwen3 / Gemma-4 target runs by pointing `--drafter` / `--target`
