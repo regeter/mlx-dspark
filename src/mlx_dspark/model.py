@@ -76,6 +76,18 @@ class CtxCache:
             self.k = mx.concatenate([self.k, k], axis=2)
             self.v = mx.concatenate([self.v, v], axis=2)
 
+    def trim_to(self, length: int) -> None:
+        """Keep only the first ``length`` context positions (seq axis) — used by prefix
+        caching to roll the drafter context back to a shared prefix. The retained K was
+        roped at its absolute position, so it stays valid after the trim."""
+        if self.k is not None and length < self.k.shape[2]:
+            self.k = self.k[:, :, :length, :]
+            self.v = self.v[:, :, :length, :]
+
+    @property
+    def length(self) -> int:
+        return 0 if self.k is None else self.k.shape[2]
+
 
 class DSparkAttention(nn.Module):
     """Cross-attention: Q from the draft block, K/V from [target_context, block]."""
@@ -268,13 +280,18 @@ class DSparkDrafter(nn.Module):
         return mx.concatenate(tokens)
 
     def sample_block_probs(self, base_logits: mx.array, first_prev_token: int,
-                           temperature: float) -> tuple[mx.array, mx.array]:
+                           temperature: float, top_p: float = 1.0,
+                           top_k: int = 0) -> tuple[mx.array, mx.array]:
         """Temperature draft for speculative *sampling*: sample each block position from
-        its (temperature-scaled) distribution and return ``(tokens [k], probs [k, V])``.
-        ``probs[i]`` is the full draft distribution q_i that token i was sampled from —
-        the verifier needs it for the accept test ``min(1, p_i(x_i)/q_i(x_i))`` and for
-        residual resampling on rejection. Sequential because the Markov bias for position
-        i depends on the token sampled at i-1."""
+        its (temperature-scaled, optionally top-p/top-k truncated) distribution and return
+        ``(tokens [k], probs [k, V])``. ``probs[i]`` is the draft distribution q_i that token
+        i was sampled from — the verifier needs it for the accept test ``min(1, p_i/q_i)`` and
+        residual resampling. Truncating q here (same top-p/top-k as the target) keeps
+        acceptance from collapsing when a client asks for nucleus sampling; losslessness comes
+        from the *target* side (see ``_spec_sample_accept``). Sequential because the Markov
+        bias for position i depends on the token sampled at i-1."""
+        from .sampling import sample_probs, truncate_probs
+
         k = base_logits.shape[0]
         inv_t = 1.0 / temperature
         tokens, probs = [], []
@@ -283,9 +300,9 @@ class DSparkDrafter(nn.Module):
             logits = base_logits[i]
             if self.markov_head is not None:
                 logits = logits + self.markov_head.step_bias(prev)[0]
-            logits = logits * inv_t
-            probs.append(mx.softmax(logits, axis=-1))
-            nxt = mx.random.categorical(logits).reshape(1)
+            q = truncate_probs(mx.softmax(logits * inv_t, axis=-1), top_p, top_k)
+            probs.append(q)
+            nxt = sample_probs(q).reshape(1)
             tokens.append(nxt)
             prev = nxt
         return mx.concatenate(tokens), mx.stack(probs, axis=0)

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from .sampling import sample_probs, truncate_probs
+
 TAP = None  # set from drafter config at call time
 
 
@@ -30,6 +32,7 @@ class GenResult:
     accept_lengths: list[int]
     target_forwards: int
     seconds: float
+    finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
 
     @property
     def mean_accept_len(self) -> float:
@@ -40,32 +43,65 @@ class GenResult:
         return self.num_tokens / max(self.seconds, 1e-9)
 
 
+def _ids_from_template_result(r) -> list[int] | None:
+    """Normalize whatever ``apply_chat_template`` returns (list[int], nested list,
+    or a BatchEncoding) into a flat list[int]. Returns None if it can't."""
+    if isinstance(r, (list, tuple)):
+        if r and isinstance(r[0], int):
+            return list(r)
+        if r and isinstance(r[0], (list, tuple)):
+            return list(r[0])
+        return list(r)
+    ii = None
+    if hasattr(r, "__contains__") and "input_ids" in r:
+        ii = r["input_ids"]
+    elif hasattr(r, "input_ids"):
+        ii = r.input_ids
+    if ii is not None:
+        ii = list(ii)
+        return list(ii[0]) if ii and isinstance(ii[0], (list, tuple)) else ii
+    if hasattr(r, "ids"):
+        return list(r.ids)
+    return None
+
+
+def encode_messages(tokenizer, messages: list[dict], add_generation_prompt: bool = True,
+                    **template_kwargs) -> list[int]:
+    """Token ids for a full chat transcript (multi-turn), via the model's chat template.
+
+    ``messages`` is the OpenAI shape: ``[{"role": "system"|"user"|"assistant", "content": ...}]``.
+    This is what the OpenAI-compatible server uses so conversations, system prompts, and
+    assistant history all reach the model exactly as its template expects. Falls back to
+    concatenating contents if the tokenizer has no chat template.
+
+    ``template_kwargs`` are passed straight to the chat template — this is how the server
+    forwards e.g. ``enable_thinking=False`` (Qwen3) or ``tools=[...]``. Unknown kwargs are
+    harmless for templates that ignore them; if a tokenizer rejects them outright we retry
+    without them rather than fail the request.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            r = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=add_generation_prompt, **template_kwargs)
+        except (TypeError, ValueError):
+            r = tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
+        ids = _ids_from_template_result(r)
+        if ids is not None:
+            return ids
+    # No template: best-effort flat concat (rare for the instruct targets we ship).
+    text = "\n".join(str(m.get("content", "")) for m in messages)
+    return list(tokenizer.encode(text))
+
+
 def encode_prompt(tokenizer, prompt: str, use_chat: bool = True) -> list[int]:
-    """Token ids for a user prompt, using the model's chat template when present.
+    """Token ids for a single user prompt, using the model's chat template when present.
 
     Gemma-4 uses `<|turn>` / `<channel|>` markers (NOT Gemma-3's `<start_of_turn>`),
     so the template must be applied via the tokenizer — hand-formatting breaks the
-    instruct model. apply_chat_template may return list[int] or a BatchEncoding.
+    instruct model. Thin wrapper over :func:`encode_messages` for the one-user-turn case.
     """
     if use_chat and getattr(tokenizer, "chat_template", None):
-        r = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}], add_generation_prompt=True
-        )
-        if isinstance(r, (list, tuple)):
-            if r and isinstance(r[0], int):
-                return list(r)
-            if r and isinstance(r[0], (list, tuple)):
-                return list(r[0])
-        ii = None
-        if hasattr(r, "__contains__") and "input_ids" in r:
-            ii = r["input_ids"]
-        elif hasattr(r, "input_ids"):
-            ii = r.input_ids
-        if ii is not None:
-            ii = list(ii)
-            return list(ii[0]) if ii and isinstance(ii[0], (list, tuple)) else ii
-        if hasattr(r, "ids"):
-            return list(r.ids)
+        return encode_messages(tokenizer, [{"role": "user", "content": prompt}])
     return list(tokenizer.encode(prompt))
 
 
@@ -93,66 +129,130 @@ def eos_token_ids(tokenizer) -> set[int]:
     return ids
 
 
-def _pick(logits_row, temperature: float) -> int:
-    """argmax (temperature 0) or a temperature sample (temperature > 0)."""
+def _pick(logits_row, temperature: float, top_p: float = 1.0, top_k: int = 0) -> int:
+    """argmax (temperature 0) or a temperature / top-p / top-k sample (temperature > 0)."""
     if temperature > 0.0:
-        return int(mx.random.categorical(logits_row / temperature).item())
+        probs = truncate_probs(mx.softmax(logits_row / temperature, axis=-1), top_p, top_k)
+        return int(sample_probs(probs).item())
     return int(mx.argmax(logits_row).item())
+
+
+class _Streamer:
+    """Round-granular text streaming + ``stop`` string detection, shared by every loop.
+
+    Each round the caller pushes the running ``out_ids``; we decode (minus eos), emit the
+    new tail via ``on_text``, and — when ``stop`` strings are configured — cut the output at
+    the earliest stop occurrence (setting ``stopped``) and never stream past it. To keep a
+    stop string that straddles two rounds from leaking, we hold back the last
+    ``max_stop - 1`` chars until it's safe (or we finish). With no stop strings and no
+    ``on_text`` this is a no-op, so the greedy/spec loops keep their exact prior behavior.
+    """
+
+    def __init__(self, tokenizer, eos_ids: set[int], on_text, stop):
+        self.tok = tokenizer
+        self.eos = eos_ids
+        self.on_text = on_text
+        self.stop = [s for s in (stop or []) if s]
+        self.max_stop = max((len(s) for s in self.stop), default=0)
+        self.streamed = 0
+        self.text = ""
+        self.stopped = False  # a stop string was hit -> caller should end the loop
+
+    def update(self, out_ids: list[int]) -> None:
+        if self.on_text is None and not self.stop:
+            return
+        disp = [t for t in out_ids if t not in self.eos]
+        full = self.tok.decode(disp)
+        cut = None
+        for s in self.stop:
+            i = full.find(s)
+            if i != -1:
+                cut = i if cut is None else min(cut, i)
+        if cut is not None:
+            full = full[:cut]
+            self.stopped = True
+        self.text = full
+        if self.on_text is None:
+            return
+        emit_to = len(full)
+        if not self.stopped and self.max_stop > 1:
+            emit_to = max(self.streamed, len(full) - (self.max_stop - 1))
+        if emit_to > self.streamed:
+            self.on_text(full[self.streamed:emit_to])
+            self.streamed = emit_to
+
+    def flush(self) -> None:
+        if self.on_text is not None and len(self.text) > self.streamed:
+            self.on_text(self.text[self.streamed:])
+            self.streamed = len(self.text)
+
+
+def _finish_reason(out_ids: list[int], max_new_tokens: int, last_tok: int,
+                   eos_ids: set[int], streamer: "_Streamer") -> str:
+    """'stop' if a stop string / eos ended it, else 'length' if we hit the token cap."""
+    if streamer.stopped or last_tok in eos_ids:
+        return "stop"
+    return "length" if len(out_ids) >= max_new_tokens else "stop"
 
 
 def greedy_generate(
     target_model,
     tokenizer,
-    prompt: str,
+    prompt: str = "",
     *,
+    prompt_ids: list[int] | None = None,
+    cache=None,
+    reuse_len: int = 0,
     max_new_tokens: int = 128,
     temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     seed: int | None = None,
     apply_chat_template: bool = True,
+    stop: list[str] | None = None,
     on_text=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
-    the spec path so a temp>0 A/B compares like-for-like). Streams via on_text."""
+    the spec path so a temp>0 A/B compares like-for-like). Streams via on_text.
+
+    ``prompt_ids`` overrides ``prompt`` with a pre-tokenized prompt (the server passes a full
+    multi-turn transcript this way); ``stop`` adds string stop-sequences (OpenAI ``stop``)."""
     if seed is not None:
         mx.random.seed(seed)
     eos_ids = eos_token_ids(tokenizer)
-    ids = encode_prompt(tokenizer, prompt, use_chat=apply_chat_template)
-    cache = target_model.make_cache()
+    ids = prompt_ids if prompt_ids is not None else encode_prompt(
+        tokenizer, prompt, use_chat=apply_chat_template)
+    if cache is None:                                  # fresh, or reuse a prefix-cached one
+        cache = target_model.make_cache()
+        reuse_len = 0
+    st = _Streamer(tokenizer, eos_ids, on_text, stop)
 
     t0 = time.time()
-    logits = target_model.plain(mx.array([ids]), cache)
-    nxt = _pick(logits[0, -1], temperature)
+    suffix = ids[reuse_len:] if reuse_len else ids      # only prefill past the reused prefix
+    logits = target_model.plain(mx.array([suffix]), cache)
+    nxt = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids = [nxt]
-    streamed = 0
 
-    def _stream():
-        nonlocal streamed
-        if on_text is None:
-            return
-        disp = [t for t in out_ids if t not in eos_ids]
-        full = tokenizer.decode(disp)
-        if len(full) > streamed:
-            on_text(full[streamed:])
-            streamed = len(full)
-
-    _stream()
-    while len(out_ids) < max_new_tokens and nxt not in eos_ids:
+    st.update(out_ids)
+    while (len(out_ids) < max_new_tokens and nxt not in eos_ids and not st.stopped):
         logits = target_model.plain(mx.array([[nxt]]), cache)
-        nxt = _pick(logits[0, -1], temperature)
+        nxt = _pick(logits[0, -1], temperature, top_p, top_k)
         out_ids.append(nxt)
-        _stream()
+        st.update(out_ids)
+    st.flush()
 
     secs = time.time() - t0
-    disp = [t for t in out_ids if t not in eos_ids]
+    text = st.text if st.stopped else tokenizer.decode([t for t in out_ids if t not in eos_ids])
     return GenResult(
-        text=tokenizer.decode(disp),
+        text=text,
         token_ids=out_ids,
         num_tokens=len(out_ids),
         num_rounds=len(out_ids),
         accept_lengths=[1] * len(out_ids),
         target_forwards=len(out_ids),
         seconds=secs,
+        finish_reason=_finish_reason(out_ids, max_new_tokens, nxt, eos_ids, st),
     )
 
 
@@ -160,13 +260,17 @@ def dflash_generate(
     target_model,
     tokenizer,
     drafter,
-    prompt: str,
+    prompt: str = "",
     *,
+    prompt_ids: list[int] | None = None,
     max_new_tokens: int = 128,
     max_draft_tokens: int | None = None,
     temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     apply_chat_template: bool = True,
     seed: int | None = None,
+    stop: list[str] | None = None,
     on_text=None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
@@ -199,40 +303,31 @@ def dflash_generate(
     cap = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
     eos_ids = eos_token_ids(tokenizer)
 
-    ids = encode_prompt(tokenizer, prompt, use_chat=apply_chat_template)
+    ids = prompt_ids if prompt_ids is not None else encode_prompt(
+        tokenizer, prompt, use_chat=apply_chat_template)
     cache = _make_target_cache(target_model)
     dcache = drafter.make_cache()                      # persistent draft ctx cache
+    st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
     # prefill
     logits, fused = _run_target(target_model, mx.array([ids]), cache, tap)
     pending_ctx = fused                                # fused hidden appended to draft ctx next round
-    pending = _pick(logits[0, -1], temperature)
+    pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
     target_forwards = 1
-    streamed = 0
 
-    def _stream():
-        nonlocal streamed
-        if on_text is None:
-            return
-        disp = [t for t in out_ids if t not in eos_ids]
-        full = tokenizer.decode(disp)
-        if len(full) > streamed:
-            on_text(full[streamed:])
-            streamed = len(full)
-
-    _stream()
-    while len(out_ids) < max_new_tokens and pending not in eos_ids:
+    st.update(out_ids)
+    while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
         # ---- draft full-width block; feeding pending_ctx appends exactly the just-
         # committed positions to the draft KV cache (DFlash caches only ctx KV, never
         # block KV) -> correct absolute RoPE offsets, no trim needed.
         block = mx.array([[pending] + [mask_id] * (bs - 1)])
         head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]  # [cap, V] mask logits
         if temperature > 0.0:
-            q_probs = mx.softmax(head / temperature, axis=-1)
-            draft_arr = mx.random.categorical(head / temperature)
+            q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
+            draft_arr = sample_probs(q_probs)
             mx.eval(draft_arr, q_probs)
         else:
             draft_arr = mx.argmax(head, axis=-1)
@@ -247,7 +342,7 @@ def dflash_generate(
         target_forwards += 1
 
         if temperature > 0.0:
-            n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature)
+            n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature, top_p, top_k)
             committed = drafted[:n] + [repl]             # accepted prefix + residual/bonus
         else:
             tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
@@ -270,18 +365,20 @@ def dflash_generate(
             if tok in eos_ids:
                 break
         pending = committed[-1]
-        _stream()
+        st.update(out_ids)
+    st.flush()
 
     secs = time.time() - t0
-    disp = [t for t in out_ids if t not in eos_ids]
+    text = st.text if st.stopped else tokenizer.decode([t for t in out_ids if t not in eos_ids])
     return GenResult(
-        text=tokenizer.decode(disp),
+        text=text,
         token_ids=out_ids,
         num_tokens=len(out_ids),
         num_rounds=len(accept_lengths),
         accept_lengths=accept_lengths,
         target_forwards=target_forwards,
         seconds=secs,
+        finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
     )
 
 
@@ -294,7 +391,7 @@ def _run_target(target, ids: mx.array, cache, tap: list[int]):
     return target.run(ids, cache, tap)
 
 
-def _spec_sample_accept(v_logits, draft, q_probs, temperature):
+def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=0):
     """Speculative-sampling acceptance (Leviathan/Chen 2023) for one verified block.
 
     ``v_logits`` [1+L, V] are the target logits at the verify positions; ``draft`` is the
@@ -302,9 +399,13 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature):
     from. Each token is accepted w.p. ``min(1, p(x)/q(x))``; the first rejection stops the
     block and resamples from the residual ``norm(max(0, p-q))``; if all accept, a bonus is
     sampled from the target. Returns ``(n_accepted, replacement_token)``. This is the rule
-    that makes the output an exact sample from the target's temperature-T distribution."""
+    that makes the output an exact sample from the target's temperature-T distribution.
+
+    With ``top_p`` / ``top_k`` the *target* distribution ``p`` is truncated first, so the
+    output is an exact sample from ``top-p/top-k(softmax(target / T))`` — still lossless, now
+    wrt the client's requested truncation (the draft ``q_probs`` were truncated to match)."""
     L = len(draft)
-    p = mx.softmax(v_logits / temperature, axis=-1)            # [1+L, V]
+    p = truncate_probs(mx.softmax(v_logits / temperature, axis=-1), top_p, top_k)  # [1+L, V]
     rows = mx.arange(L)
     idx = mx.array(draft)
     pd = p[rows, idx]                                          # target prob of each drafted token
@@ -322,7 +423,7 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature):
         resid = resid / mx.maximum(resid.sum(), 1e-9)
         repl = int(mx.random.categorical(mx.log(resid + 1e-20)).item())
     else:
-        repl = int(mx.random.categorical(v_logits[L] / temperature).item())  # target bonus
+        repl = int(sample_probs(p[L]).item())                # target bonus from the (truncated) p
     return n, repl
 
 
@@ -330,14 +431,21 @@ def speculative_generate(
     target_model,
     tokenizer,
     drafter,
-    prompt: str,
+    prompt: str = "",
     *,
+    prompt_ids: list[int] | None = None,
+    cache=None,
+    ctx_caches=None,
+    reuse_len: int = 0,
     max_new_tokens: int = 128,
     confidence_threshold: float = 0.0,
     max_draft_tokens: int | None = 2,
     temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     seed: int | None = None,
     apply_chat_template: bool = True,
+    stop: list[str] | None = None,
     on_text=None,
     verbose: bool = False,
 ) -> GenResult:
@@ -371,40 +479,33 @@ def speculative_generate(
     eos_ids = eos_token_ids(tokenizer)
 
     # --- tokenize prompt ---
-    ids = encode_prompt(tokenizer, prompt, use_chat=apply_chat_template)
-    prompt_ids = mx.array([ids])
+    ids = prompt_ids if prompt_ids is not None else encode_prompt(
+        tokenizer, prompt, use_chat=apply_chat_template)
 
-    cache = _make_target_cache(target_model)
-    ctx_caches = drafter.make_ctx_cache()
+    # Prefix caching: the caller may pass a target cache + drafter ctx already holding the
+    # first `reuse_len` tokens (a shared conversation prefix); then we only prefill the
+    # suffix. `cache is None` = the standalone/library path (fresh caches, reuse_len=0).
+    if cache is None:
+        cache = _make_target_cache(target_model)
+        ctx_caches = drafter.make_ctx_cache()
+        reuse_len = 0
+    st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
-    # --- prefill ---
-    logits, fused = _run_target(target_model, prompt_ids, cache, tap)
-    n_cached = prompt_ids.shape[1]
-    drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx_caches)
-    if temperature > 0.0:
-        pending = int(mx.random.categorical(logits[0, -1] / temperature).item())
-    else:
-        pending = int(mx.argmax(logits[0, -1]).item())  # first committed token
+    # --- prefill (only the suffix past any reused prefix) ---
+    suffix = ids[reuse_len:] if reuse_len else ids
+    logits, fused = _run_target(target_model, mx.array([suffix]), cache, tap)
+    n_cached = len(ids)
+    drafter.update_context(fused, ctx_offset=reuse_len, ctx_caches=ctx_caches)
+    pending = _pick(logits[0, -1], temperature, top_p, top_k)  # first committed token
     mx.eval([c.k for c in ctx_caches])
 
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
     target_forwards = 1
-    streamed = 0
 
-    def _stream():
-        nonlocal streamed
-        if on_text is None:
-            return
-        disp = [t for t in out_ids if t not in eos_ids]
-        full = tokenizer.decode(disp)
-        if len(full) > streamed:
-            on_text(full[streamed:])
-            streamed = len(full)
-
-    _stream()
-    while len(out_ids) < max_new_tokens and pending not in eos_ids:
+    st.update(out_ids)
+    while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
         # ---- 1. draft a block ----
         # The backbone runs full-width: block attention is bidirectional, so each
         # position's hidden depends on the whole block, and shrinking it would change
@@ -418,7 +519,8 @@ def speculative_generate(
         head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
         base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
         if temperature > 0.0:
-            draft_arr, q_probs = drafter.sample_block_probs(base_logits, pending, temperature)
+            draft_arr, q_probs = drafter.sample_block_probs(
+                base_logits, pending, temperature, top_p, top_k)
             mx.eval(draft_arr, q_probs)
         else:
             draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
@@ -453,7 +555,7 @@ def speculative_generate(
 
         # ---- 3. accept ----
         if temperature > 0.0:
-            n, repl = _spec_sample_accept(v_logits[0], draft, q_probs, temperature)
+            n, repl = _spec_sample_accept(v_logits[0], draft, q_probs, temperature, top_p, top_k)
             committed = draft[:n] + [repl]                     # accepted prefix + residual/bonus
         else:
             tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
@@ -481,16 +583,16 @@ def speculative_generate(
             if tok in eos_ids:
                 break
         pending = committed[-1]
-        _stream()
+        st.update(out_ids)
 
         if verbose:
             print(f"  round {len(accept_lengths):3d}: drafted {len(draft)}, "
                   f"accepted {n}, committed {len(committed)}")
+    st.flush()
 
     secs = time.time() - t0
-    # strip trailing eos for display
-    disp = [t for t in out_ids if t not in eos_ids]
-    text = tokenizer.decode(disp)
+    # strip trailing eos for display (or cut at a stop string)
+    text = st.text if st.stopped else tokenizer.decode([t for t in out_ids if t not in eos_ids])
     return GenResult(
         text=text,
         token_ids=out_ids,
@@ -499,4 +601,5 @@ def speculative_generate(
         accept_lengths=accept_lengths,
         target_forwards=target_forwards,
         seconds=secs,
+        finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
     )

@@ -13,7 +13,7 @@ EAGLE-family speculative-decoding drafter:
 This package targets single-user local inference on Apple Silicon.
 """
 
-__version__ = "0.0.3"
+__version__ = "0.1.0"
 
 from .config import DSparkConfig
 from .dflash_model import DFlashConfig, DFlashDraftModel
@@ -22,13 +22,23 @@ from .load import (
     DEFAULT_TARGET,
     DFLASH_PRESETS,
     PRESETS,
+    REGISTRY,
     load_dflash,
     load_dflash_pair,
     load_drafter,
     load_pair,
     load_target,
+    resolve,
 )
-from .generate import GenResult, dflash_generate, greedy_generate, speculative_generate
+from .generate import (
+    GenResult,
+    dflash_generate,
+    encode_messages,
+    encode_prompt,
+    greedy_generate,
+    speculative_generate,
+)
+from .server import Engine, run_server
 from .target import Target
 
 __all__ = [
@@ -44,9 +54,15 @@ __all__ = [
     "speculative_generate",
     "dflash_generate",
     "greedy_generate",
+    "encode_messages",
+    "encode_prompt",
     "GenResult",
+    "Engine",
+    "run_server",
     "PRESETS",
     "DFLASH_PRESETS",
+    "REGISTRY",
+    "resolve",
     "DEFAULT_TARGET",
     "DEFAULT_DRAFTER",
 ]

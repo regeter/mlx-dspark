@@ -43,6 +43,72 @@ DFLASH_PRESETS = {
     },
 }
 
+# ---------------------------------------------------------------------------------------------
+# Model registry — invisible plumbing that auto-resolves the *drafter* for a known *target*.
+#
+# The interface is standard (like mlx-lm): you pass a real target repo/path as `--model`. This
+# table just saves you from also looking up the matched drafter for the handful of known targets;
+# for anything else, pass `--drafter`. Matching is quant-agnostic (the drafter matches the *model*,
+# not its quantization), so Qwen3-8B-4bit / -8bit / -bf16 all resolve the same drafter. There are
+# **no user-facing nicknames** — `id` is only the substring we match against a target repo name.
+REGISTRY = [
+    {"id": "qwen3-4b",   "target": "mlx-community/Qwen3-4B-8bit",
+     "dspark": "deepseek-ai/dspark_qwen3_4b_block7", "dflash": "z-lab/Qwen3-4B-DFlash-b16",
+     "ram": "~8 GB"},
+    {"id": "qwen3-8b",   "target": "mlx-community/Qwen3-8B-8bit",
+     "dspark": "deepseek-ai/dspark_qwen3_8b_block7", "dflash": "z-lab/Qwen3-8B-DFlash-b16",
+     "ram": "~11 GB"},
+    {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
+     "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
+     "ram": "~15 GB"},
+]
+
+# legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
+_FAMILY_ALIASES = {
+    "qwen3": "mlx-community/Qwen3-4B-8bit",
+    "gemma4": "mlx-community/gemma-4-12B-it-8bit",
+}
+
+
+def _registry_entry(target: str) -> dict | None:
+    """Find the registry entry whose model id matches this target repo/path (quant-agnostic)."""
+    key = os.path.basename(str(target).rstrip("/")).lower()
+    key_nodash = key.replace("-", "")
+    # longest id first so e.g. 'gemma-4-12b' wins over any shorter accidental match
+    for entry in sorted(REGISTRY, key=lambda e: -len(e["id"])):
+        eid = entry["id"]
+        if eid in key or eid.replace("-", "") in key_nodash:
+            return entry
+    return None
+
+
+def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | None = None,
+            family: str | None = None, target: str | None = None) -> tuple[str, str | None]:
+    """Resolve ``(target_repo, drafter_repo)`` from a ``--model`` target and ``--mode``.
+
+    ``model`` is a target HF repo or local path (the standard interface). The drafter is taken
+    from ``drafter`` if given, else auto-resolved from :data:`REGISTRY` for a known target, else
+    a helpful error. ``family`` and ``target`` are accepted as **deprecated** aliases for ``model``
+    (old ``--family`` / ``--target``); a bare ``"qwen3"``/``"gemma4"`` passed as ``model`` is also
+    treated as the legacy family alias. ``mode="baseline"`` returns ``(target, None)``.
+    """
+    tgt = model or target or family
+    if tgt in _FAMILY_ALIASES:                     # legacy "qwen3"/"gemma4"
+        tgt = _FAMILY_ALIASES[tgt]
+    if not tgt:
+        tgt = DEFAULT_TARGET
+    if mode == "baseline":
+        return tgt, None
+    if drafter:
+        return tgt, drafter
+    entry = _registry_entry(tgt)
+    if entry is not None and entry.get(mode):
+        return tgt, entry[mode]
+    raise ValueError(
+        f"no built-in {mode} drafter is registered for target {tgt!r} — pass --drafter <repo> "
+        f"(or use a known target; see `mlx-dspark models`)."
+    )
+
 
 def _resolve(repo_or_path: str) -> str:
     if os.path.isdir(repo_or_path):
@@ -172,19 +238,23 @@ def load_target(repo_or_path: str = DEFAULT_TARGET):
     return Target(model, tokenizer), tokenizer
 
 
-def load_pair(family: str = "gemma4", *, target_bits: str | None = None):
-    """Convenience: load (target, tokenizer, drafter, cfg) for a preset family."""
-    p = PRESETS[family]
-    target, tok = load_target(p["target"])
-    drafter, cfg = load_drafter(p["drafter"])
-    return target, tok, drafter, cfg
+def load_pair(model: str = "gemma4", *, drafter: str | None = None):
+    """Convenience: load (target, tokenizer, DSpark drafter, cfg).
+
+    ``model`` is a target HF repo or local path (e.g. ``"mlx-community/Qwen3-8B-8bit"``); the
+    matched drafter auto-resolves from the registry, or pass ``drafter=``. A legacy family alias
+    (``"qwen3"`` / ``"gemma4"``) is still accepted."""
+    target_repo, drafter_repo = resolve(model, mode="dspark", drafter=drafter)
+    target, tok = load_target(target_repo)
+    drafter_m, cfg = load_drafter(drafter_repo)
+    return target, tok, drafter_m, cfg
 
 
-def load_dflash_pair(family: str = "gemma4"):
-    """Convenience: load (target, tokenizer, dflash_drafter, cfg) for a DFlash preset.
-    The drafter is bound to the target's embed/lm_head, ready for ``dflash_generate``."""
-    p = DFLASH_PRESETS[family]
-    target, tok = load_target(p["target"])
-    drafter, cfg = load_dflash(p["drafter"])
-    drafter.bind(target.model)
-    return target, tok, drafter, cfg
+def load_dflash_pair(model: str = "gemma4", *, drafter: str | None = None):
+    """Convenience: load (target, tokenizer, DFlash drafter, cfg), drafter bound to the target's
+    embed/lm_head and ready for ``dflash_generate``. ``model`` as in :func:`load_pair`."""
+    target_repo, drafter_repo = resolve(model, mode="dflash", drafter=drafter)
+    target, tok = load_target(target_repo)
+    drafter_m, cfg = load_dflash(drafter_repo)
+    drafter_m.bind(target.model)
+    return target, tok, drafter_m, cfg
