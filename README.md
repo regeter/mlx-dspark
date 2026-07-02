@@ -26,6 +26,11 @@ used to accelerate DeepSeek-V4) and z-lab's **DFlash** (block diffusion). Both a
 target verifies every token, so output is identical to normal decoding — and run under one verify loop,
 so you can benchmark them head-to-head. `pip install mlx-dspark` (full setup in [Install](#install)).
 
+> **What this is *not*:** DeepSeek-V4 inference. The targets are dense models (Gemma-4, Qwen3) that DeepSeek
+> published DSpark drafters for — so this runs their real drafter method on a Mac, but the model producing
+> tokens is Gemma / Qwen, not V4. V4 Flash/Pro (MoE, batched serving) is DSpark's own headline use case and
+> needs a V4 engine like [ds4](https://github.com/antirez/ds4).
+
 **Built-in presets** (`--family`) — pick a drafter with `--mode dspark` (default) or `--mode dflash`:
 
 | family | target (instruct, 8-bit) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | peak RAM |
@@ -134,6 +139,16 @@ Markov head keeps the lead on **open chat** (1.65×). They're complementary:
 |---|---|---|---|
 | DSpark (cap 2) | **1.65×** (acc 2.45) | 1.89× (2.78) | 1.89× (2.86) |
 | DFlash (full 16) | 0.98× (2.68) | **2.10×** (5.95) | **2.12×** (6.20) |
+
+**Which to use — it's the target's verify cost, not just the content:**
+
+| target (verify cost) | DSpark (cap 2) | DFlash (full-16) | pick |
+|---|---|---|---|
+| Gemma-4 12B — *expensive verify* | 1.65× chat, ~1.9× code/math | **~2.1×** code/math, ~1.0× chat | DFlash on code/math, DSpark on chat |
+| Qwen3-8B — *cheap verify* | **~1.6× everywhere** | ~0.9–1.1× (wash) | **DSpark** |
+
+Bigger / slower-verify target → DFlash's full block pays off on code/math; smaller / fast target → DSpark
+wins outright (confirmed against z-lab's own dflash-mlx runner — see [DSpark vs DFlash](#dspark-vs-dflash--eagle3)).
 
 Full per-method table + analysis in [DSpark vs DFlash](#dspark-vs-dflash--eagle3).
 
