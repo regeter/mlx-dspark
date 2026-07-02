@@ -4,8 +4,9 @@
 
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — running natively on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>Lossless drafters that make Gemma-4 12B and Qwen3-4B faster on a Mac — same output, with a built-in
-  <br>DSpark-vs-DFlash head-to-head (DSpark <b>~1.6× / ~1.4×</b>; DFlash up to <b>~2.1×</b> on code/math).
+  <br>Lossless drafters — same output, just faster — for Gemma-4 12B and Qwen3 (4B/8B), plus any matched
+  <br>z-lab DFlash adapter. Built-in DSpark-vs-DFlash head-to-head: the winner flips with the model —
+  <br>DFlash's block-16 hits <b>~2.1×</b> on code/math on the big target, DSpark (<b>~1.4–1.6×</b>) wins chat and smaller ones.
 </p>
 
 <p align="center">
@@ -269,11 +270,16 @@ the picture flips. Qwen3-8B-8bit (M4 Pro, warm, greedy, 3 prompts/domain, accept
 | DFlash (cap 2) | 1.99 / 33.8 | 2.22 / 37.0 | 2.11 / 35.7 |
 | DFlash (full 16) | 2.19 / 21.1 | 2.94 / 27.6 | 2.66 / 25.5 |
 
-Here **DSpark wins everywhere (~1.6×)** and DFlash's full-16 block is a net *loss* (0.86×): Qwen3-8B's
-verify is cheap, so the wide block costs more than it returns and acceptance never climbs (~2.9 on code vs
-5.95 on the 12B). DFlash's block-16 edge needs an *expensive*-verify target — a big model like the 12B, or
-batched GPU serving — to pay off. (Qwen3-4B is the same story, more extreme: verify is even cheaper.) So:
-**bigger / slower-verify target → favor DFlash full-block on code/math; smaller / fast target → DSpark.**
+Here **DSpark wins everywhere (~1.6×)** while DFlash's block advantage largely evaporates: the full-16 block
+is a net *loss* (~0.9×) and even its best short-block mode only reaches ~1.1–1.3× on code. Qwen3-8B's verify
+is cheap, so the wide block costs more than it returns and acceptance never climbs (~2.9 on code vs 5.95 on
+the 12B). DFlash's block-16 edge needs an *expensive*-verify target (a big model like the 12B, or batched GPU
+serving); rule of thumb: **bigger / slower-verify target → DFlash full-block on code/math; smaller / fast → DSpark.**
+
+Cross-checked against z-lab's own optimized runner [`dflash-mlx`](https://github.com/bstnxbt/dflash-mlx) on the
+*identical* target + drafter: its baseline matches ours (29.3 tok/s), and its DFlash is also a net loss at the
+full block (0.92× on code) and only ~1.08× in adaptive mode — *even with its hand-written Metal verify kernels*.
+So this is DFlash at this model scale on Apple Silicon, not an artifact of mlx-dspark's verify loop.
 
 Reproduce these (Qwen3-8B has no preset — point `--drafter`/`--target` at the repos; downloads on first run):
 
