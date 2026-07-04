@@ -59,3 +59,36 @@ def test_unknown_target_without_drafter_errors():
 def test_local_path_basename_matched():
     # a local path is matched by its basename
     assert resolve("/models/Qwen3-8B-8bit", mode="dspark")[1] == "deepseek-ai/dspark_qwen3_8b_block7"
+
+
+# --------------------------------------------------------------------------- resolve_mode
+
+
+def test_resolve_mode_auto_known_target_picks_dspark():
+    from mlx_dspark.load import resolve_mode
+
+    mode, tgt, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="auto")
+    assert mode == "dspark" and drf == "deepseek-ai/dspark_qwen3_8b_block7"
+
+
+def test_resolve_mode_auto_unknown_target_falls_back_to_lookup():
+    from mlx_dspark.load import resolve_mode
+
+    mode, tgt, drf = resolve_mode("some-org/Weird-Model-3B-4bit", mode="auto")
+    assert mode == "lookup" and drf is None and tgt == "some-org/Weird-Model-3B-4bit"
+
+
+def test_resolve_mode_auto_with_explicit_drafter_is_dspark():
+    from mlx_dspark.load import resolve_mode
+
+    mode, tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
+    assert mode == "dspark" and drf == "org/d"
+
+
+def test_resolve_mode_passthrough_non_auto():
+    from mlx_dspark.load import resolve_mode
+
+    assert resolve_mode("mlx-community/Qwen3-8B-8bit", mode="lookup") == (
+        "lookup", "mlx-community/Qwen3-8B-8bit", None)
+    mode, _, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="dflash")
+    assert mode == "dflash" and drf == "z-lab/Qwen3-8B-DFlash-b16"

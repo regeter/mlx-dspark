@@ -50,6 +50,84 @@ def test_earliest_of_multiple_stops_wins():
     assert text == "xx" and stopped
 
 
+def test_incremental_feed_matches_full_decode():
+    # feed one token at a time (the greedy loop's pattern): streamed text, final text,
+    # and a full decode must all agree, and eos ids must never render
+    tok = _FakeTok()
+    chunks = []
+    st = g._Streamer(tok, {9999}, chunks.append, None)
+    msg = "incremental detokenization, olé! → 対応"
+    out = []
+    for c in msg:
+        out.append(ord(c))
+        st.update(out)
+    out.append(9999)  # trailing eos must be filtered
+    st.update(out)
+    st.flush()
+    assert "".join(chunks) == msg and st.text == msg
+
+
+def test_streamer_uses_streaming_detokenizer_for_fast_tokenizers():
+    # a real byte-level-BPE fast tokenizer (the qwen-style case) must select mlx-lm's
+    # BPE streaming detokenizer — not the O(n²) full-decode fallback — and produce
+    # byte-identical text to tokenizer.decode
+    tokenizers = __import__("pytest").importorskip("tokenizers")
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    tk = Tokenizer(models.BPE(unk_token=None))
+    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tk.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(vocab_size=400, special_tokens=[])
+    tk.train_from_iterator(["hello world, hello streaming detokenizers!"] * 4, trainer)
+    fast = PreTrainedTokenizerFast(tokenizer_object=tk)
+
+    detok = g._make_detokenizer(fast)
+    assert isinstance(detok, BPEStreamingDetokenizer)
+
+    text = "hello world, hello streaming!"
+    ids = fast.encode(text)
+    chunks = []
+    st = g._Streamer(fast, set(), chunks.append, None)
+    out = []
+    for i in ids:
+        out.append(i)
+        st.update(out)
+    st.flush()
+    assert st.text == fast.decode(ids)
+    assert "".join(chunks) == st.text
+
+
+def test_fallback_detokenizer_for_minimal_tokenizers():
+    detok = g._make_detokenizer(_FakeTok())
+    assert isinstance(detok, g._FullDecodeDetokenizer)
+
+
+def test_stop_streaming_ends_generation_gracefully():
+    # an on_text that raises StopStreaming (the server does this on client disconnect) must
+    # flip `stopped` — so the loop ends normally — without propagating the exception
+    chunks = []
+
+    def on_text(piece):
+        chunks.append(piece)
+        if sum(map(len, chunks)) >= 3:
+            raise g.StopStreaming()
+
+    st = g._Streamer(_FakeTok(), set(), on_text, None)
+    out = []
+    for ch in "abcdefgh":
+        out.append(ord(ch))
+        st.update(out)
+        if st.stopped:
+            break
+    st.flush()
+    assert st.stopped and st.on_text is None
+    assert "".join(chunks) == "abc"       # nothing streamed past the disconnect
+    assert st.text.startswith("abc")      # partial text still recorded for the GenResult
+
+
 class _StreamerLike:
     stopped = False
 

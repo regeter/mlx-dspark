@@ -23,6 +23,9 @@ class _FakeTok:
     def encode(self, text):
         return [ord(c) for c in text][:64]
 
+    def decode(self, ids):
+        return "".join(chr(int(i) % 0x110000) for i in ids)
+
 
 class _FakeEngine:
     mode = "dspark"
@@ -31,6 +34,10 @@ class _FakeEngine:
     target_repo = "org/Target"
     drafter_repo = "org/Drafter"
     template_defaults = {}
+    sampling_defaults = {}
+    default_max_tokens = 2048
+    max_tokens_cap = 32768
+    cap_controller = None
 
     def __init__(self):
         self.tokenizer = _FakeTok()
@@ -38,17 +45,24 @@ class _FakeEngine:
         self.response_text = "Hello world from mlx dspark"
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
+                 presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
                  stop, seed, on_text=None):
         self.calls.append(dict(prompt_ids=prompt_ids, max_tokens=max_tokens,
                                temperature=temperature, top_p=top_p, top_k=top_k,
+                               presence_penalty=presence_penalty,
+                               frequency_penalty=frequency_penalty, logprobs=logprobs,
                                stop=stop, seed=seed))
         text = self.response_text
         if on_text:
             for w in text.split(" "):
                 on_text(w + " ")
+        lp = None
+        if logprobs is not None:
+            lp = [{"token_id": t, "logprob": -0.5,
+                   "top": [(t, -0.5)] if logprobs else []} for t in [1, 2, 3, 4, 5]]
         return GenResult(text=text, token_ids=[1, 2, 3, 4, 5], num_tokens=5, num_rounds=2,
                          accept_lengths=[2, 3], target_forwards=2, seconds=0.1,
-                         finish_reason="stop")
+                         finish_reason="stop", logprobs=lp)
 
     def spec_info(self, res):
         return {"mode": self.mode, "accept_len": res.mean_accept_len,
@@ -174,6 +188,31 @@ def test_no_tools_means_plain_text(server):
     assert "<tool_call>" in c["choices"][0]["message"]["content"]
 
 
+def test_sampling_defaults_fill_absent_fields_only(server):
+    eng, base = server
+    eng.sampling_defaults = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+    # request omits sampling params -> the model's generation_config recommendations apply
+    _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    call = eng.calls[-1]
+    assert call["temperature"] == 0.6 and call["top_p"] == 0.95 and call["top_k"] == 20
+    # explicit values (including an explicit 0.0) always win over the defaults
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.0, "top_p": 1.0})
+    call = eng.calls[-1]
+    assert call["temperature"] == 0.0 and call["top_p"] == 1.0 and call["top_k"] == 20
+
+
+def test_max_tokens_default_and_cap(server):
+    eng, base = server
+    eng.default_max_tokens = 777
+    eng.max_tokens_cap = 1000
+    _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert eng.calls[-1]["max_tokens"] == 777          # absent -> engine default
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5000})
+    assert eng.calls[-1]["max_tokens"] == 1000         # above the configurable ceiling -> clamped
+
+
 def test_metrics(server):
     _, base = server
     _post(base, "/v1/completions", {"prompt": "x"})
@@ -212,3 +251,40 @@ def test_auth_required():
         assert c["object"] == "chat.completion"
     finally:
         httpd.shutdown()
+
+
+def test_logprobs_chat_response_shape(server):
+    eng, base = server
+    c = _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}],
+               "logprobs": True, "top_logprobs": 3})
+    lp = c["choices"][0]["logprobs"]
+    assert "content" in lp and len(lp["content"]) == 5
+    first = lp["content"][0]
+    assert set(first) >= {"token", "logprob", "bytes", "top_logprobs"}
+    assert len(first["top_logprobs"]) == 1              # fake returns one top per token
+    assert eng.calls[-1]["logprobs"] == 3              # top_logprobs threaded through
+
+
+def test_logprobs_absent_by_default(server):
+    eng, base = server
+    c = _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert "logprobs" not in c["choices"][0]
+    assert eng.calls[-1]["logprobs"] is None
+
+
+def test_completions_logprobs_shape(server):
+    eng, base = server
+    c = _post(base, "/v1/completions", {"prompt": "hi", "logprobs": 2})
+    lp = c["choices"][0]["logprobs"]
+    assert "tokens" in lp and "token_logprobs" in lp and "top_logprobs" in lp
+    assert eng.calls[-1]["logprobs"] == 2
+
+
+def test_penalties_passthrough(server):
+    eng, base = server
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}],
+           "presence_penalty": 1.5, "frequency_penalty": 0.7})
+    assert eng.calls[-1]["presence_penalty"] == 1.5
+    assert eng.calls[-1]["frequency_penalty"] == 0.7

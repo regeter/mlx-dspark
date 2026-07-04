@@ -2,9 +2,10 @@
 
 Subcommands:
   serve      Start an OpenAI-compatible API server (LM Studio / openai SDK / curl).
-  generate   One-shot local generation (DSpark / DFlash / baseline). This is also the
-             default when no subcommand is given, so the historical flat invocation
+  generate   One-shot local generation (DSpark / DFlash / lookup / baseline). This is also
+             the default when no subcommand is given, so the historical flat invocation
              ``python -m mlx_dspark --prompt ...`` keeps working unchanged.
+  benchmark  Warm, reproducible speed sweep on this machine (baseline vs the spec modes).
   models     List the built-in target+drafter presets.
   doctor     Check the environment (Apple Silicon, MLX stack, RAM vs. model size).
 
@@ -19,7 +20,7 @@ import time
 
 from .load import REGISTRY, resolve
 
-_SUBCOMMANDS = ("serve", "generate", "models", "doctor")
+_SUBCOMMANDS = ("serve", "generate", "benchmark", "models", "doctor")
 
 
 def _emit(s: str) -> None:
@@ -30,13 +31,29 @@ def _emit(s: str) -> None:
 # --------------------------------------------------------------------------- generate
 
 
+def _parse_max_draft(value: str | None, ap) -> int | str | None:
+    """--max-draft accepts an int or 'auto' (calibrated per machine+model, adapts live)."""
+    if value is None:
+        return None
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError:
+        ap.error(f"--max-draft must be an integer or 'auto', got {value!r}")
+
+
 def cmd_generate(argv: list[str]) -> None:
     from .generate import dflash_generate, greedy_generate, speculative_generate
-    from .load import load_dflash, load_drafter, load_target
+    from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
+    from .lookup import lookup_generate
 
     ap = argparse.ArgumentParser(prog="mlx-dspark generate")
-    ap.add_argument("--mode", choices=["dspark", "dflash", "baseline"], default="dspark",
+    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
+                    default="dspark",
                     help="dspark = DSpark spec decoding; dflash = z-lab DFlash (block diffusion); "
+                         "lookup = drafter-free prompt-lookup spec decoding (any target); "
+                         "auto = best available for this target (dspark -> dflash -> lookup); "
                          "baseline = plain greedy target")
     ap.add_argument("--model", default=None,
                     help="target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). "
@@ -47,9 +64,10 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--target", default=None, help=argparse.SUPPRESS)  # deprecated alias for --model
     ap.add_argument("--prompt", default="Explain how rainbows form, in a few sentences.")
     ap.add_argument("--max-new-tokens", type=int, default=220)
-    ap.add_argument("--max-draft", type=int, default=2,
-                    help="tokens verified per round (cap). For --mode dflash, <=0 means the full "
-                         "block (its native operating point — strongest on code/math).")
+    ap.add_argument("--max-draft", default=None,
+                    help="tokens verified per round (cap), or 'auto' to calibrate for this "
+                         "machine+model and adapt live. Defaults: dspark=2, lookup=6, "
+                         "dflash=full block (<=0 also means full block).")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 = greedy (exact); >0 = speculative sampling (paper setup, lossless wrt target@T)")
     ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling (temperature > 0)")
@@ -57,21 +75,27 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--confidence-threshold", type=float, default=0.0)
     ap.add_argument("--drafter-bits", type=int, default=4)
+    ap.add_argument("--no-lookup-drafts", action="store_true",
+                    help="disable hybrid n-gram drafting inside dspark mode (on by default; "
+                         "free extra speedup on copy-heavy spans, lossless either way)")
     ap.add_argument("--no-chat-template", action="store_true")
     ap.add_argument("--no-stream", action="store_true")
     args = ap.parse_args(argv)
 
     try:
-        target_repo, drafter_repo = resolve(args.model, mode=args.mode, drafter=args.drafter,
-                                            family=args.family, target=args.target)
+        mode, target_repo, drafter_repo = resolve_mode(
+            args.model, mode=args.mode, drafter=args.drafter,
+            family=args.family, target=args.target)
     except ValueError as e:
         ap.error(str(e))
+    args.mode = mode
 
     labels = {"dspark": "DSpark speculative", "dflash": "DFlash (z-lab) speculative",
+              "lookup": "Prompt-lookup speculative (drafter-free)",
               "baseline": "Baseline (plain greedy)"}
     label = labels[args.mode]
     print(f"loading {args.mode}: target={target_repo}"
-          + (f", drafter={drafter_repo}" if args.mode != "baseline" else ""))
+          + (f", drafter={drafter_repo}" if drafter_repo else ""))
     target, tok = load_target(target_repo)
     drafter = None
     if args.mode == "dspark":
@@ -82,27 +106,53 @@ def cmd_generate(argv: list[str]) -> None:
                                  bits=max(args.drafter_bits, 2))
         drafter.bind(target.model)
 
+    max_draft = _parse_max_draft(args.max_draft, ap)
+    cap_controller = None
+    if max_draft == "auto":
+        if args.mode in ("dspark", "dflash"):
+            from .calibrate import calibrate
+
+            cap_controller = calibrate(target, drafter, mode=args.mode,
+                                       target_repo=target_repo, drafter_repo=drafter_repo)
+        max_draft = None                                   # controller (or mode default) drives
+
+    apply_wired_limit()
     on_text = None if args.no_stream else _emit
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
     print("=" * 64)
 
     if args.mode == "dspark":
+        cap = (2 if max_draft is None and cap_controller is None else max_draft)
         res = speculative_generate(
             target, tok, drafter, args.prompt,
-            max_new_tokens=args.max_new_tokens, max_draft_tokens=args.max_draft,
+            max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
+            cap_controller=cap_controller, lookup_drafts=not args.no_lookup_drafts,
             confidence_threshold=args.confidence_threshold,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
+        if res.lookup_rounds:
+            extra += f" · {res.lookup_rounds} lookup rounds"
     elif args.mode == "dflash":
+        cap = None if (max_draft is None or max_draft <= 0) else max_draft
         res = dflash_generate(
             target, tok, drafter, args.prompt,
-            max_new_tokens=args.max_new_tokens,
-            max_draft_tokens=(None if args.max_draft <= 0 else args.max_draft),
+            max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
+            cap_controller=cap_controller,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
             seed=args.seed, apply_chat_template=not args.no_chat_template, on_text=on_text,
+        )
+        extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
+    elif args.mode == "lookup":
+        cap = 6 if (max_draft is None or not isinstance(max_draft, int) or max_draft <= 0) \
+            else max_draft
+        res = lookup_generate(
+            target, tok, args.prompt,
+            max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
+            temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
+            apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
     else:
@@ -112,6 +162,8 @@ def cmd_generate(argv: list[str]) -> None:
             apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = ""
+    if cap_controller is not None:
+        extra += f" · auto-cap now {cap_controller.cap} (p≈{cap_controller.p:.2f})"
     if args.no_stream:
         print(res.text)
 
@@ -125,11 +177,14 @@ def cmd_generate(argv: list[str]) -> None:
 
 
 def cmd_serve(argv: list[str]) -> None:
-    from .server import Engine, run_server
+    from .server import Engine, maybe_batch_engine, run_server
 
     ap = argparse.ArgumentParser(prog="mlx-dspark serve",
                                  description="OpenAI-compatible API server.")
-    ap.add_argument("--mode", choices=["dspark", "dflash", "baseline"], default="dspark")
+    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
+                    default="dspark",
+                    help="'auto' picks the best available speculation for the target "
+                         "(dspark -> dflash -> drafter-free lookup), so any repo serves")
     ap.add_argument("--model", default=None,
                     help="target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). "
                          "Matched drafter auto-resolves for known targets; else pass --drafter. "
@@ -138,11 +193,29 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--family", choices=["gemma4", "qwen3"], default=None,
                     help=argparse.SUPPRESS)          # deprecated alias for --model
     ap.add_argument("--target", default=None, help=argparse.SUPPRESS)  # deprecated alias for --model
-    ap.add_argument("--max-draft", type=int, default=None,
-                    help="cap on tokens verified per round; <=0 = full block. Default: dspark=2, "
+    ap.add_argument("--max-draft", default=None,
+                    help="cap on tokens verified per round; <=0 = full block; 'auto' = calibrate "
+                         "for this machine+model and adapt live. Default: dspark=2, lookup=6, "
                          "dflash=full block.")
+    ap.add_argument("--default-max-tokens", type=int, default=2048,
+                    help="max_tokens used when a request doesn't send one (default 2048)")
+    ap.add_argument("--max-tokens-cap", type=int, default=32768,
+                    help="hard ceiling on per-request max_tokens (default 32768 — thinking "
+                         "models routinely need >8k)")
+    ap.add_argument("--default-temperature", type=float, default=None,
+                    help="temperature for requests that don't send one (overrides the model's "
+                         "generation_config; note many mlx-community repos ship none, in which "
+                         "case omitted temperature means greedy unless this is set)")
+    ap.add_argument("--default-top-p", type=float, default=None,
+                    help="top_p for requests that don't send one (see --default-temperature)")
+    ap.add_argument("--default-top-k", type=int, default=None,
+                    help="top_k for requests that don't send one (see --default-temperature)")
     ap.add_argument("--confidence-threshold", type=float, default=0.0)
     ap.add_argument("--drafter-bits", type=int, default=4)
+    ap.add_argument("--max-batch", type=int, default=1,
+                    help="micro-batch up to N concurrently-queued requests through one batched "
+                         "target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x "
+                         "aggregate throughput at 2-4 concurrent). 1 = serialized (default)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=None,
@@ -152,7 +225,13 @@ def cmd_serve(argv: list[str]) -> None:
                          "clients can still override per-request")
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="disable multi-turn prefix caching (reuse the shared conversation "
-                         "prefix's KV; on by default for dspark/baseline on dense targets)")
+                         "prefix's KV; on by default for dspark/lookup/baseline on dense or "
+                         "under-window sliding-window targets)")
+    ap.add_argument("--prefix-cache-slots", type=int, default=2,
+                    help="number of conversations kept in the prefix cache LRU (default 2, "
+                         "so an agent and a chat don't evict each other every turn)")
+    ap.add_argument("--no-lookup-drafts", action="store_true",
+                    help="disable hybrid n-gram drafting inside dspark mode")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -160,9 +239,9 @@ def cmd_serve(argv: list[str]) -> None:
                          "of RAM (0 = never spill; requires --prefix-cache-dir)")
     args = ap.parse_args(argv)
 
-    md = args.max_draft
-    if md is None:
-        max_draft = None                                   # engine picks the mode default
+    md = _parse_max_draft(args.max_draft, ap)
+    if md is None or md == "auto":
+        max_draft = md                                     # engine picks default / calibrates
     elif args.mode == "dflash" and md <= 0:
         max_draft = None                                   # full block
     else:
@@ -179,10 +258,127 @@ def cmd_serve(argv: list[str]) -> None:
             prefix_cache=not args.no_prefix_cache,
             prefix_cache_dir=args.prefix_cache_dir,
             prefix_cache_max_ram_mb=args.prefix_cache_max_ram_mb,
+            default_max_tokens=args.default_max_tokens,
+            max_tokens_cap=args.max_tokens_cap,
+            default_temperature=args.default_temperature,
+            default_top_p=args.default_top_p,
+            default_top_k=args.default_top_k,
+            prefix_cache_slots=args.prefix_cache_slots,
+            lookup_drafts=not args.no_lookup_drafts,
         )
     except ValueError as e:
         ap.error(str(e))
+    engine = maybe_batch_engine(engine, args.max_batch)
     run_server(engine, host=args.host, port=args.port, api_key=args.api_key)
+
+
+# --------------------------------------------------------------------------- benchmark
+
+
+BENCH_PROMPTS = {
+    "chat": "Explain how rainbows form.",
+    "code": "Write a Python function to check if a string is a palindrome.",
+    "math": "A train travels 120 km in 1.5 hours. What is its average speed in m/s? "
+            "Show your work.",
+}
+
+
+def cmd_benchmark(argv: list[str]) -> None:
+    """Warm, reproducible sweep on this machine — the numbers behind the README table.
+    Runs a greedy baseline first, then each requested mode/cap on the same prompts."""
+    import json as _json
+    import platform
+
+    import mlx.core as mx
+
+    from .generate import dflash_generate, greedy_generate, speculative_generate
+    from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
+    from .lookup import lookup_generate
+
+    ap = argparse.ArgumentParser(prog="mlx-dspark benchmark")
+    ap.add_argument("--model", default=None, help="target repo/path (see `mlx-dspark models`)")
+    ap.add_argument("--drafter", default=None)
+    ap.add_argument("--modes", default="dspark,lookup",
+                    help="comma-separated: dspark, dflash, lookup (baseline always runs)")
+    ap.add_argument("--caps", default="2,auto",
+                    help="comma-separated caps for dspark/dflash: ints and/or 'auto'")
+    ap.add_argument("--max-new-tokens", type=int, default=200)
+    ap.add_argument("--json", default=None, help="also write results to this JSON file")
+    args = ap.parse_args(argv)
+
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    caps = [c.strip() for c in args.caps.split(",") if c.strip()]
+    apply_wired_limit()
+
+    dev = mx.device_info().get("device_name", "?")
+    print(f"mlx-dspark benchmark · {dev} · mlx {mx.__version__} · "
+          f"{platform.machine()} {platform.system()}")
+
+    _, target_repo, _ = resolve_mode(args.model, mode="auto", drafter=args.drafter)
+    print(f"target: {target_repo}\nloading + warming up…")
+    target, tok = load_target(target_repo)
+    greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
+
+    results = {"device": dev, "mlx": mx.__version__, "target": target_repo, "runs": []}
+
+    def run(label, fn):
+        toks = tps = accept = 0.0
+        for p in BENCH_PROMPTS.values():
+            r = fn(p)
+            toks += r.num_tokens
+            tps += r.tokens_per_sec
+            accept += r.mean_accept_len
+        n = len(BENCH_PROMPTS)
+        row = {"run": label, "tok_s": round(tps / n, 1), "accept": round(accept / n, 2)}
+        results["runs"].append(row)
+        base = results["runs"][0]["tok_s"]
+        speedup = f"  ({row['tok_s'] / base:.2f}x)" if label != "baseline" else ""
+        print(f"  {label:<22} {row['tok_s']:>7.1f} tok/s   accept {row['accept']:.2f}{speedup}")
+        return row
+
+    print(f"\n{'run':<24} {'tok/s':>7}")
+    run("baseline", lambda p: greedy_generate(
+        target, tok, p, max_new_tokens=args.max_new_tokens))
+
+    for mode in modes:
+        if mode == "lookup":
+            run("lookup", lambda p: lookup_generate(
+                target, tok, p, max_new_tokens=args.max_new_tokens))
+            continue
+        try:
+            _, _, drafter_repo = resolve_mode(args.model, mode=mode, drafter=args.drafter)
+        except ValueError as e:
+            print(f"  {mode:<22} skipped ({e})")
+            continue
+        if mode == "dspark":
+            drafter, _ = load_drafter(drafter_repo)
+        else:
+            drafter, _ = load_dflash(drafter_repo)
+            drafter.bind(target.model)
+        for cap in caps:
+            ctrl = None
+            md: int | None = None
+            if cap == "auto":
+                from .calibrate import calibrate
+
+                ctrl = calibrate(target, drafter, mode=mode, target_repo=target_repo,
+                                 drafter_repo=drafter_repo, verbose=False)
+            else:
+                md = int(cap)
+            if mode == "dspark":
+                run(f"dspark cap={cap}", lambda p: speculative_generate(
+                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
+                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+            else:
+                run(f"dflash cap={cap}", lambda p: dflash_generate(
+                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
+                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+        del drafter
+
+    if args.json:
+        with open(args.json, "w") as f:
+            _json.dump(results, f, indent=1)
+        print(f"\nwrote {args.json}")
 
 
 # --------------------------------------------------------------------------- models
@@ -251,6 +447,21 @@ def cmd_doctor(argv: list[str]) -> None:
         check("System RAM", total_gb >= 15,
               f"{total_gb:.0f} GB (gemma4 preset ~15 GB, qwen3 ~8 GB)")
 
+    # wired-limit hint: with big models, letting macOS page the weights mid-generation is
+    # the classic silent slowdown; a raised iogpu limit keeps them resident
+    try:
+        import subprocess
+        wired = int(subprocess.run(["sysctl", "-n", "iogpu.wired_limit_mb"],
+                                   capture_output=True, text=True).stdout.strip() or 0)
+        if wired:
+            print(f"  · iogpu.wired_limit_mb = {wired}")
+        elif total_gb and total_gb >= 16:
+            print(f"  · tip: for large models, raise the GPU wired limit, e.g. "
+                  f"`sudo sysctl iogpu.wired_limit_mb={int(total_gb * 0.75 * 1024)}` "
+                  f"(mlx-dspark also wires the recommended working set at start)")
+    except Exception:  # noqa: BLE001
+        pass
+
     from . import __version__
     print(f"\nmlx-dspark {__version__} — {'ready' if ok else 'issues above'}.")
     if not ok:
@@ -282,6 +493,8 @@ def main(argv: list[str] | None = None) -> None:
         return cmd_models(argv[1:])
     if sub == "doctor":
         return cmd_doctor(argv[1:])
+    if sub == "benchmark":
+        return cmd_benchmark(argv[1:])
     if sub == "generate":
         return cmd_generate(argv[1:])
     if sub in _SUBCOMMANDS:  # defensive; unreachable

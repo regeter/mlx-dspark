@@ -16,11 +16,31 @@ class KVCache:  # name matters: target_cache_reusable whitelists exactly "KVCach
         return n
 
 
-class RotatingKVCache:  # a non-reusable type
-    offset = 0
+class RotatingKVCache:  # legacy-shaped rotating cache without the mlx-lm rotation
+    offset = 0          # machinery (max_size / is_trimmable) — must stay non-reusable
 
     def trim(self, n):
         return 0
+
+
+class RealRotatingKVCache:
+    """mlx-lm-shaped rotating cache: linear (trimmable) until offset reaches max_size."""
+
+    def __init__(self, offset=0, max_size=512):
+        self.offset = offset
+        self.max_size = max_size
+
+    def is_trimmable(self):
+        return self.offset < self.max_size
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+
+# make target_cache_reusable's name check match the real class
+RealRotatingKVCache.__name__ = "RotatingKVCache"
 
 
 class FakeCtx:
@@ -51,6 +71,62 @@ def test_lcp():
 def test_reusable_detection():
     assert target_cache_reusable([KVCache(), KVCache()]) is True
     assert target_cache_reusable([KVCache(), RotatingKVCache()]) is False
+    # rotating caches WITH the mlx-lm rotation machinery are structurally reusable
+    # (the wrap is caught per-entry at store time)
+    assert target_cache_reusable([KVCache(), RealRotatingKVCache()]) is True
+
+
+def test_wrapped_rotating_cache_is_not_stored():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=1)
+    prompt = list(range(20))
+    cache = [RealRotatingKVCache(max_size=16), KVCache()]
+    ctx = _mk_ctx()
+    cache[0].offset = 16                        # wrapped its window during generation
+    cache[1].offset = 21
+    pc.store(cache, ctx, prompt, [99, 100])
+    assert pc.info()["cached_tokens"] == 0      # refused
+    # under the window it stores fine
+    cache[0].offset = 10
+    pc.store(cache, ctx, prompt, [99, 100])
+    assert pc.info()["cached_tokens"] == 21
+
+
+def test_lru_two_slots_dont_evict_each_other():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
+    conv_a = list(range(100, 120))
+    conv_b = list(range(200, 220))
+    ca, xa, _ = pc.acquire(conv_a)
+    for c in ca:
+        c.offset = len(conv_a)
+    pc.store(ca, xa, conv_a, [1, 2])
+    cb, xb, _ = pc.acquire(conv_b)              # different conversation -> fresh caches
+    assert cb is not ca
+    for c in cb:
+        c.offset = len(conv_b)
+    pc.store(cb, xb, conv_b, [3, 4])
+    # both conversations now hit their own slot
+    got_a, _, reuse_a = pc.acquire(conv_a + [1, 130])
+    assert got_a is ca and reuse_a == len(conv_a) + 1
+    pc.store(got_a, xa, conv_a + [1, 130], [5, 6])
+    got_b, _, reuse_b = pc.acquire(conv_b + [3, 230])
+    assert got_b is cb and reuse_b == len(conv_b) + 1
+    assert pc.hits == 2
+
+
+def test_lru_eviction_beyond_capacity():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
+    convs = [list(range(i * 100, i * 100 + 20)) for i in (1, 2, 3)]
+    for conv in convs:
+        c, x, _ = pc.acquire(conv)
+        for layer in c:
+            layer.offset = len(conv)
+        pc.store(c, x, conv, [7, 8])
+    assert len(pc.info()["slots"]) == 2
+    # the oldest conversation was evicted; the two most recent still hit
+    _, _, r1 = pc.acquire(convs[0] + [9])
+    assert r1 == 0
+    _, _, r2 = pc.acquire(convs[2] + [9])
+    assert r2 > 0
 
 
 def test_acquire_empty_is_fresh():

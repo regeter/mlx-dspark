@@ -90,14 +90,15 @@ def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | No
     from ``drafter`` if given, else auto-resolved from :data:`REGISTRY` for a known target, else
     a helpful error. ``family`` and ``target`` are accepted as **deprecated** aliases for ``model``
     (old ``--family`` / ``--target``); a bare ``"qwen3"``/``"gemma4"`` passed as ``model`` is also
-    treated as the legacy family alias. ``mode="baseline"`` returns ``(target, None)``.
+    treated as the legacy family alias. ``mode="baseline"`` / ``"lookup"`` need no drafter and
+    return ``(target, None)`` — so those modes work with ANY target, registered or not.
     """
     tgt = model or target or family
     if tgt in _FAMILY_ALIASES:                     # legacy "qwen3"/"gemma4"
         tgt = _FAMILY_ALIASES[tgt]
     if not tgt:
         tgt = DEFAULT_TARGET
-    if mode == "baseline":
+    if mode in ("baseline", "lookup"):
         return tgt, None
     if drafter:
         return tgt, drafter
@@ -105,9 +106,44 @@ def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | No
     if entry is not None and entry.get(mode):
         return tgt, entry[mode]
     raise ValueError(
-        f"no built-in {mode} drafter is registered for target {tgt!r} — pass --drafter <repo> "
-        f"(or use a known target; see `mlx-dspark models`)."
+        f"no built-in {mode} drafter is registered for target {tgt!r} — pass --drafter <repo>, "
+        f"use a known target (see `mlx-dspark models`), or use `--mode auto` / `--mode lookup` "
+        f"(drafter-free, works with any target)."
     )
+
+
+def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str | None = None,
+                 family: str | None = None, target: str | None = None
+                 ) -> tuple[str, str, str | None]:
+    """Like :func:`resolve` but also resolves ``mode="auto"``: pick the best available
+    speculation for this target — the registry's DSpark drafter if the target is known
+    (DSpark won every M-series head-to-head at the short-block operating point), else its
+    DFlash drafter, else drafter-free prompt-lookup — so ANY target gets some speculation.
+    Returns ``(resolved_mode, target_repo, drafter_repo)``."""
+    if mode != "auto":
+        tgt, drf = resolve(model, mode=mode, drafter=drafter, family=family, target=target)
+        return mode, tgt, drf
+    if drafter:                                    # explicit drafter + auto -> DSpark adapter
+        tgt, drf = resolve(model, mode="dspark", drafter=drafter, family=family, target=target)
+        return "dspark", tgt, drf
+    tgt, _ = resolve(model, mode="baseline", family=family, target=target)
+    entry = _registry_entry(tgt)
+    if entry is not None:
+        if entry.get("dspark"):
+            return "dspark", tgt, entry["dspark"]
+        if entry.get("dflash"):
+            return "dflash", tgt, entry["dflash"]
+    return "lookup", tgt, None
+
+
+def apply_wired_limit() -> None:
+    """Wire MLX's recommended working set (what mlx-lm's server does) so multi-GB weights
+    stay resident under memory pressure instead of getting paged mid-generation."""
+    try:
+        if mx.metal.is_available():
+            mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    except Exception:  # noqa: BLE001 — a hint, never a failure
+        pass
 
 
 def _resolve(repo_or_path: str) -> str:

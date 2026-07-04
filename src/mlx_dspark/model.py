@@ -137,7 +137,11 @@ class DSparkAttention(nn.Module):
         k, v = self._kv(fused_new)
         cache.append(self.rope(k, offset=ctx_offset), v)   # V is not roped
 
-    def attend(self, hidden: mx.array, block_offset: int, cache: CtxCache) -> mx.array:
+    def attend(self, hidden: mx.array, block_offset, cache, mask=None) -> mx.array:
+        """``block_offset`` may be an int (single sequence) or a per-row ``[B]`` array (batched
+        drafting — rows sit at different context lengths). ``mask`` is None for the single-seq
+        path (block attends the whole context + all block positions) or a ``[B, 1, k, Lctx+k]``
+        boolean mask that hides each row's context padding when ``cache.k/v`` are a batched buffer."""
         B, q_len, _ = hidden.shape
         q = self.q_proj(hidden).reshape(B, q_len, self.n_heads, self.head_dim)
         q = self.rope(self.q_norm(q).transpose(0, 2, 1, 3), offset=block_offset)
@@ -149,7 +153,7 @@ class DSparkAttention(nn.Module):
 
         k = _repeat_kv(k, self.n_rep)
         v = _repeat_kv(v, self.n_rep)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, q_len, -1)
         return self.o_proj(out)
 
@@ -168,11 +172,11 @@ class DSparkDecoderLayer(nn.Module):
             self.post_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
             self.layer_scalar = mx.ones((1,))
 
-    def __call__(self, hidden, block_offset, cache: CtxCache):
+    def __call__(self, hidden, block_offset, cache, mask=None):
         if self.norm_style == "gemma":
             residual = hidden
             h = self.input_layernorm(hidden)
-            h = self.self_attn.attend(h, block_offset, cache)
+            h = self.self_attn.attend(h, block_offset, cache, mask)
             h = self.post_attention_layernorm(h)
             h = residual + h
             residual = h
@@ -184,7 +188,7 @@ class DSparkDecoderLayer(nn.Module):
         # qwen / llama 2-norm
         residual = hidden
         h = self.input_layernorm(hidden)
-        h = self.self_attn.attend(h, block_offset, cache)
+        h = self.self_attn.attend(h, block_offset, cache, mask)
         h = residual + h
         residual = h
         h = self.post_attention_layernorm(h)
@@ -254,10 +258,10 @@ class DSparkDrafter(nn.Module):
         for layer, cache in zip(self.layers, ctx_caches):
             layer.self_attn.update_ctx(fused, ctx_offset, cache)
 
-    def backbone(self, noise_embedding, block_offset, ctx_caches) -> mx.array:
+    def backbone(self, noise_embedding, block_offset, ctx_caches, mask=None) -> mx.array:
         h = noise_embedding
         for layer, cache in zip(self.layers, ctx_caches):
-            h = layer(h, block_offset, cache)
+            h = layer(h, block_offset, cache, mask)
         return self.norm(h)
 
     def compute_logits(self, hidden: mx.array) -> mx.array:

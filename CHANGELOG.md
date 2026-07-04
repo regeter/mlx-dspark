@@ -2,6 +2,123 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+## [0.2.0] — 2026-07-04 — continuous batching, penalties & logprobs, auto-calibration, prompt-lookup, decode-path performance
+
+### Added
+- **Continuous batching (`serve --max-batch N`, the moonshot).** Run up to N concurrently-queued
+  requests through one batched target forward so they share a single weight-read per step — the
+  paper's cheap-verify regime, on a Mac. New `batch_engine.py`: a general dense-mlx-lm batched
+  forward (any Qwen3/Llama/Mistral-class target; gemma-4 vlm falls back to serialized) over a
+  **left-aligned per-row-offset KV cache** (per-row trim = O(1) metadata, the rollback batched
+  spec needs; mlx-lm's `BatchKVCache` can only trim uniformly). `BatchEngine` micro-batches
+  requests with matching sampling params; a lone request / temp>0 dspark / penalized / logprobs
+  request takes the serial path, so B=1 latency never regresses. Both the target verify **and** the
+  DSpark drafter are batched (the drafter's ragged per-row context is padded + masked). Measured
+  (Qwen3-4B-8bit, M4 Pro, 4 concurrent): **baseline B=4 2.46× aggregate**, **dspark spec B=4 ~1.67×
+  over serialized spec** (129 tok/s; batching the drafter adds 1.16× over verify-only). Lossless
+  per row: B=1 is bit-exact vs single-seq;
+  at B>1 output is greedy-correct up to the target's batch-dependent quantized-matmul rounding (the
+  same qmv→qmm knee as the perf notes; ~0.5% of tokens, inherent to any batched quantized server).
+- **`presence_penalty` / `frequency_penalty` (OpenAI), lossless-wrt-penalized-target.** Penalizes
+  the target logits (each verify position by the base completion counts **plus** its own draft
+  prefix) so speculative/greedy output equals sequential decoding of the penalized target — for
+  temp>0 too (speculative sampling stays exact wrt the penalized target `p`). Validated: penalized
+  spec == penalized baseline byte-for-byte; opt-in (default path untouched, ~0.9× when active).
+- **`logprobs` / `top_logprobs` (chat + completions).** Reports the raw target log-softmax at each
+  committed token (chosen + top-k), gathered on-GPU only when requested (default fused path
+  untouched). Validated: logprob vs a fresh forward matches to ~1e-6; spec and baseline report
+  identical logprobs. Response uses OpenAI `choices[].logprobs.content[]` (and the completions shape).
+- **Hardware-aware dspark-vs-DFlash signal (`calibrate.knee_width` / `drafter_recommendation`).**
+  Detects the quantized-matmul knee from the calibrated verify curve: a small knee (M-series, ~4)
+  → dspark wins (what `--mode auto` picks); a knee that has moved past the DFlash block width
+  (M5-class) → DFlash full-block re-enters play. Surfaced in the calibration output + `/metrics.auto_cap`.
+- **`--max-draft auto` (hardware-aware auto-calibration).** On Apple Silicon the verify cost is
+  convex in tokens-per-round with a machine/model-dependent knee (M4 Pro + gemma-12B-8bit: knee
+  at width 4 — the reason cap=2 was optimal). `auto` measures this machine+model's verify/drafter
+  cost curves once (~seconds, cached in `~/.cache/mlx_dspark/`) and a live controller picks the
+  cap each round from the curves + an acceptance EWMA — so the cap tracks the hardware (M1→M5),
+  the model, and the content, instead of a hard-coded default. Works for `dspark` and `dflash`,
+  CLI + server (`x_mlx_dspark.cap`, `/metrics.auto_cap`). Lossless by construction: the cap only
+  decides how many drafted tokens are *verified*; the target still verifies every emitted token.
+- **`--mode lookup` (prompt-lookup speculative decoding).** Drafter-free speculation for **any**
+  target model mlx-lm/mlx-vlm can load: propose the continuation of the most recent earlier
+  occurrence of the current suffix n-gram (RAG quotes, code edits, "repeat/refine" turns), verify
+  with the target as usual. No draft on a miss (zero overhead — trigram-minimum matching keeps
+  chat overhead ~1–4%), greedy-lossless, temperature>0 supported via one-hot-proposal speculative
+  sampling (still an exact target sample). Measured (Qwen3-4B, thinking off): copy-heavy prompt
+  **2.38× (119 tok/s, accept 5.9)**, code edit 1.19× — all outputs identical to greedy. New
+  `lookup_generate()` API; server + CLI wired; prefix caching works (it's a plain dense-cache path).
+- **Sampling defaults from the model's `generation_config.json`** (server): requests that omit
+  `temperature`/`top_p`/`top_k` now get the model authors' recommended values instead of silently
+  greedy. Explicit request values — including explicit 0 — always win. Shown at startup. Many
+  mlx-community conversions ship no `generation_config.json` (the Qwen3 repos don't; gemma does),
+  so `--default-temperature` / `--default-top-p` / `--default-top-k` flags can supply them.
+- **`--default-max-tokens` (2048) / `--max-tokens-cap` (32768)** — replaces the old fixed
+  512-default/8192-cap, which truncated thinking models mid-reasoning.
+
+- **`--mode auto`** — picks the best available speculation for the target: the registry's
+  DSpark drafter if known, else DFlash, else drafter-free lookup — so **any** model repo now
+  serves with some speculation and no extra flags (unknown targets previously errored).
+- **Hybrid drafting (dspark mode, on by default)** — when the current suffix n-gram already
+  occurred in the context (quoting, code edits, repeats), the free continuation is verified
+  instead of running the drafter that round; elsewhere DSpark drafts as usual. Lossless
+  composition; disable with `--no-lookup-drafts`. `GenResult.lookup_rounds` /
+  `x_mlx_dspark.lookup_rounds` show how often it fired.
+- **Prefix caching for Gemma-4 (sliding-window targets)** — rotating caches are exact until
+  they first wrap, so entries are reused while under the window and refused at store time the
+  moment any layer wraps. Gemma multi-turn now skips re-prefilling like Qwen does.
+- **LRU prefix-cache slots** (`--prefix-cache-slots`, default 2) — an agent process and a chat
+  window no longer evict each other's conversation every turn; per-slot SSD spill retained.
+- **`mlx-dspark benchmark`** — warm, reproducible sweep (baseline + chosen modes/caps,
+  including `auto`) with device + mlx version, optional `--json` — for comparable numbers
+  across M1→M5 machines.
+- **Chunked prefill** — long prompts prefill in 2048-token pieces with `mx.clear_cache()`
+  between, bounding activation memory (the `[L, vocab]` logits especially) on ≤16 GB Macs;
+  identical single-forward path for prompts within one chunk. The engine also wires MLX's
+  recommended working set at start (like mlx-lm's server) so weights stay resident;
+  `doctor` reports/suggests `iogpu.wired_limit_mb`.
+
+### Fixed
+- **`import mlx_dspark` crashed on transformers ≥5.13** (`AttributeError: 'str' object has no
+  attribute '__module__'`), which fresh installs resolve to. Root cause is upstream: mlx_lm registers
+  a tokenizer by a string key and transformers 5.13 made `_LazyAutoMapping.register` assume a config
+  *class*; the failure runs at mlx_lm module scope, so it took down `import mlx_dspark`. A scoped,
+  idempotent compat shim in `__init__` restores the pre-5.13 behavior for non-class keys — no
+  `transformers` version pin, real class keys untouched. Reported by @zboyles (#1).
+- **Serving Gemma-4 (mlx-vlm targets) was broken since 0.1.0** — every request failed with
+  `There is no Stream(gpu, 1) in current thread`. Root cause: mlx-vlm's model load switches the
+  loading thread's default stream to a thread-local one, so models loaded on the main thread
+  couldn't be run from the engine's generation thread. The engine now loads (and calibrates) on
+  the same single thread that generates. (Qwen was unaffected — mlx-lm doesn't switch streams.)
+- **A streaming client disconnect no longer invalidates the prefix cache.** The server converts
+  a broken pipe into a graceful stop (`StopStreaming`): generation ends at the round boundary,
+  the (consistent) caches are stored, and the next turn still gets prefix reuse.
+- Speculative loops now stop when an accepted draft contains eos mid-block (previously they
+  could generate past it).
+
+## Decode-path performance (same release)
+
+Output is unchanged everywhere (byte-identical token ids, streamed text, and final text validated
+A/B on Qwen3-4B, 300- and 1200-token runs, greedy + dspark). Measured on an M4 Pro:
+
+### Changed
+- **Streaming detokenization is now incremental** (`_Streamer` feeds mlx-lm streaming
+  detokenizers; SPM/BPE class auto-selected for plain HF fast tokenizers, full-re-decode fallback
+  for anything else). Previously every round re-decoded the whole output — O(n²) over a
+  generation, worst exactly on long/thinking outputs.
+- **One device sync per speculative round** (greedy default path, dspark + dflash): the drafted
+  tokens no longer round-trip to the CPU before verify — `verify_ids` is assembled on-GPU and the
+  accepted-prefix length is computed in-graph (cumprod of positionwise matches). Drafter-context
+  updates are scheduled with `mx.async_eval` instead of blocking.
+- **Pipelined baseline decode** (`greedy_generate`): step t+1 is scheduled on the GPU before step
+  t's token is read (mlx-lm style `async_eval`), overlapping detokenize/emit with GPU compute.
+  Closes the previously-noted ~5% gap vs `mlx_lm.generate` (baseline now ~52 tok/s on Qwen3-4B-8bit,
+  at parity with the official runner).
+- Net: baseline **+6–7%**, dspark **+2–3%** on Qwen3-4B (larger relative effect on long streamed
+  generations); 3 new model-free tests (48 total).
+
 ## [0.1.0] — serving & tooling
 
 Turns mlx-dspark from a library + demo CLI into a usable local **tool** — serve a DSpark/DFlash

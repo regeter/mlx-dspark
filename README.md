@@ -47,9 +47,12 @@ drafter is resolved automatically for known targets (see [Models](#models)), or 
 
 ```bash
 mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0.1:8080/v1
-#   add --mode dflash for the DFlash drafter · --mode baseline for plain decoding
-#       --no-thinking to silence Qwen3 <think> blocks by default · --api-key KEY to require auth
+#   --max-batch 4   serve up to 4 concurrent requests in one batched pass (~2.5× aggregate)
+#   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
 ```
+
+`--mode auto` picks the best available speculation for any target (a known DSpark drafter → else
+DFlash → else drafter-free n-gram **lookup**), so *any* repo serves with some speedup and no extra flags.
 
 Then point any OpenAI client at it — the speculative speedup is transparent:
 
@@ -66,11 +69,13 @@ print(client.chat.completions.create(
 
 The server speaks the OpenAI API: `POST /v1/chat/completions` (streaming **and** non-streaming,
 multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metrics`. It supports
-`temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, **tool calling** (`tools` /
-`tool_calls`), and a per-request thinking toggle (`enable_thinking`). Each response carries an
-`x_mlx_dspark` block (accept length + tok/s) so the spec-decode gain is visible. **Prefix caching** is on
-by default, so multi-turn chat doesn't re-prefill the conversation each turn (~13× faster follow-up turns
-on a long shared context — see [Prefix caching](#prefix-caching)).
+`temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `presence_penalty` / `frequency_penalty`,
+`logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), and a per-request thinking toggle
+(`enable_thinking`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
+spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
+batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
+**prefix caching** (on by default) reuses the conversation prefix so multi-turn chat doesn't re-prefill
+each turn (~13× faster follow-up turns on a long shared context — see [Prefix caching](#prefix-caching)).
 
 ### One-shot generation (CLI)
 
@@ -174,6 +179,28 @@ paper's own band (60–85% per-user speedup in batched serving = ~1.6–1.85×);
 other papers on datacenter GPUs. Why a Mac can't go much higher, the full DSpark-vs-DFlash head-to-head, and
 the cost model are below.
 
+## Concurrent throughput
+
+`--max-batch N` runs up to N concurrently-queued requests through **one** batched target forward, so
+they share a single weight-read per step — the regime where speculative decoding really shines. For a
+local agent swarm (a few agents hitting the server at once) this is a large aggregate win, and single
+requests are unaffected: a lone request — or one using penalties / logprobs / `temperature > 0` dspark —
+takes the serial path, so per-request latency never regresses.
+
+Qwen3-4B-8bit, M4 Pro, 4 concurrent requests (aggregate tokens/s vs the greedy baseline run serially):
+
+| serving | aggregate tok/s | vs serialized baseline |
+|---|---|---|
+| greedy baseline (one at a time) | 52 | 1.00× |
+| **batched baseline** (`--mode baseline --max-batch 4`) | 128 | **2.48×** |
+| **batched dspark** (`--mode dspark --max-batch 4`) | 130 | **2.51×** (1.73× over serialized dspark) |
+
+Both the target verify **and** the DSpark drafter are batched. Output stays greedy-correct per request; a
+batched *quantized* target is not bit-identical to single-sequence decoding (the quantized matmul takes a
+different numeric path at batch width — the same qmv→qmm knee as the cost model below — flipping ~0.5% of
+near-tie tokens), which is inherent to any batched quantized server, not spec-specific. Dense mlx-lm
+targets (Qwen3 / Llama / Mistral-class) only; Gemma-4 (mlx-vlm) transparently falls back to serialized.
+
 ## Prefix caching
 
 The server keeps the target KV cache (and, for DSpark, the drafter context) from the previous turn and
@@ -182,16 +209,19 @@ follow-up turns **~13× faster** (measured: 87 ms vs 1132 ms). It's **lossless**
 rest of the project (a warm turn differs from a cold one only at logit-margin≈0 ties) and invalidates itself
 on any error so it can't desync.
 
-On by default for `--mode dspark` / `baseline` on **dense** targets (Qwen3). It's disabled for DFlash and for
-Gemma-4 (whose sliding-window KV caches can't be safely rolled back to an arbitrary prefix) — those fall back
-to a fresh prefill. Flags: `--no-prefix-cache`, and `--prefix-cache-dir DIR` + `--prefix-cache-max-ram-mb N`
-to enable the optional SSD spill tier for very long contexts.
+On by default for `--mode dspark` / `baseline` on **dense** targets (Qwen3); disabled for DFlash. For
+**Gemma-4** (sliding-window / rotating KV cache) reuse is exact only until the window first wraps, so entries
+are reused while under the window and refused once any layer wraps — multi-turn chat under the window skips
+re-prefilling like Qwen does. Flags: `--no-prefix-cache`, `--prefix-cache-slots N` (LRU slots so a chat and
+an agent don't evict each other, default 2), and `--prefix-cache-dir DIR` + `--prefix-cache-max-ram-mb N`
+for the optional SSD spill tier on very long contexts.
 
 ---
 
 ## Benchmarks & deep dive
 
 *Everything below is for readers who want the numbers and the why. The sections above are enough to use it.*
+Reproduce the sweep on your own Mac with `mlx-dspark benchmark --model <repo>` (warm, device-stamped, `--json`).
 
 ### The Apple-Silicon speedup ceiling
 
@@ -266,6 +296,13 @@ Since verify dominates, target precision is a speed/quality knob:
 - **DSpark** — `--max-draft 2` is the measured optimum for every target (default): verify cost grows per
   token and the marginal draft token rarely survives. `--confidence-threshold 0.6` truncates the block
   adaptively via the confidence head instead.
+- **`--max-draft auto`** — measures this machine + model's verify/drafter cost curves once (a few seconds,
+  cached on disk) and picks the cap per round from the curves + a live acceptance estimate, so it tracks the
+  hardware (M1→M5) instead of the hard-coded `cap=2`. Lossless — the cap only sets how many drafts get verified.
+- **Hybrid n-gram drafting** (dspark, on by default) — when the current suffix already occurred earlier in the
+  context (quoting, code edits, repeats), that free continuation is verified instead of running the drafter
+  that round, so copy-heavy spans commit several tokens per round. Composes losslessly; `--no-lookup-drafts`
+  turns it off. `--mode lookup` runs the same n-gram speculation with **no drafter at all**, for any target.
 - **DFlash** — use **`--max-draft 0`** (full 16-block, its native point) on **code/math**, where acceptance
   reaches ~6; use a short cap on **open chat**, where the block doesn't fill and the full block is a net loss.
 - **Sampling** — `--temperature > 0` (+ `--top-p` / `--top-k`) is lossless w.r.t. the target at temperature T

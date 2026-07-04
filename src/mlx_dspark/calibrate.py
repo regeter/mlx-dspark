@@ -1,0 +1,320 @@
+"""Hardware-aware auto-calibration for the speculative cap (``--max-draft auto``).
+
+Why this exists: on Apple Silicon the verify cost is NOT linear in the number of tokens
+verified per round — it is convex with a machine/model-dependent knee (measured on
+gemma-4-12B-8bit / M4 Pro: ~5 ms/tok for widths 1–3, then +19 ms for the 4th, where MLX's
+quantized matmul leaves its cheap few-rows path for GEMM tiling; see NOTES "Perf pass 2").
+So the optimal cap is a property of the (machine, target, drafter) triple and moves across
+chip generations. Instead of a hard-coded default, measure the cost curves once per pair
+(a few seconds, cached on disk) and let a small controller pick the cap that maximizes
+expected tokens/second under a live acceptance estimate.
+
+Pieces:
+  * ``measure_verify_curve`` / ``measure_dspark_drafter_curve`` / ``measure_dflash_drafter_cost``
+    — warm synthetic-forward timings. Content-independent (pure compute), so a constant token
+    id is fine; the caches are trimmed back between iterations so every timing sees the same state.
+  * ``CapController`` — per-*position* conditional acceptance EWMA. Each round contributes
+    Bernoulli observations (n successes, plus one failure unless the block was fully accepted,
+    which is censored), so rounds run at ANY cap update the same estimate; expected committed
+    tokens at a candidate cap C is the geometric extrapolation 1 + Σ_{i<=C} p^i. The cap picked
+    is argmax of committed / (drafter(C) + verify(C+1)), with hysteresis against flapping.
+  * ``calibrate`` — measure-or-load with a JSON disk cache keyed by device, mlx version, mode,
+    and model basenames.
+
+Correctness: the cap only chooses how many drafted tokens are *verified* per round — the
+backbone always drafts full-width and the target verifies every emitted token — so output is
+lossless for ANY per-round cap sequence. Auto-cap can never change what is generated.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+
+import mlx.core as mx
+
+CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
+CACHE_FILE = "calibration.json"
+SCHEMA = 1
+CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
+TOKEN_ID = 7           # arbitrary; timings are content-independent
+
+
+def _bench(fn, iters: int = 8, warmup: int = 3) -> float:
+    for _ in range(warmup):
+        mx.eval(fn())
+    mx.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        mx.eval(fn())
+    mx.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3  # ms
+
+
+# --------------------------------------------------------------------------- measurement
+
+
+def measure_verify_curve(target, tap: list[int], widths: list[int],
+                         ctx_len: int = CTX_LEN) -> dict[int, float]:
+    """ms per verify forward (with the hidden-state tap) at each width, warm cache."""
+    cache = target.make_cache()
+    mx.eval(target.run(mx.array([[TOKEN_ID] * ctx_len]), cache, tap)[0])
+    curve: dict[int, float] = {}
+    for m in sorted(widths):
+        x = mx.array([[TOKEN_ID] * m])
+
+        def fn():
+            logits, _ = target.run(x, cache, tap)
+            for c in cache:                      # roll back so every iteration is identical
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(m)
+            return logits
+
+        curve[m] = _bench(fn)
+    return curve
+
+
+def measure_dspark_drafter_curve(drafter, caps: list[int],
+                                 ctx_len: int = CTX_LEN) -> dict[int, float]:
+    """ms per DSpark draft round at each cap (backbone is full-width; lm_head/markov
+    run over ``cap`` positions — the slice fix — so cost grows mildly with cap)."""
+    cfg = drafter.config
+    k = cfg.block_size
+    ctx = drafter.make_ctx_cache()
+    fused = mx.random.normal(
+        (1, ctx_len, len(cfg.target_layer_ids) * cfg.hidden_size)).astype(mx.bfloat16)
+    drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx)
+    mx.eval([c.k for c in ctx])
+    block_ids = [TOKEN_ID] * k
+    curve: dict[int, float] = {}
+    for cap in sorted(caps):
+
+        def fn():
+            noise = drafter.embed(mx.array([block_ids]))
+            hidden = drafter.backbone(noise, ctx_len, ctx)
+            logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+            return drafter.sample_block(logits, first_prev_token=TOKEN_ID)
+
+        curve[cap] = _bench(fn)
+    return curve
+
+
+def measure_dflash_drafter_cost(drafter, ctx_len: int = CTX_LEN) -> float:
+    """ms per DFlash draft round (cap-independent: the drafter always denoises and reads
+    logits for the full block)."""
+    cfg = drafter.config
+    n_tap = len(cfg.target_layer_ids)
+    dcache = drafter.make_cache()
+    ctx = mx.random.normal((1, ctx_len, n_tap * cfg.hidden_size)).astype(mx.bfloat16)
+    block = mx.array([[TOKEN_ID] + [int(cfg.mask_token_id)] * (int(cfg.block_size) - 1)])
+    mx.eval(drafter(block, ctx, dcache, logits_start=1))     # appends ctx to the draft cache
+    step_ctx = mx.random.normal((1, 2, n_tap * cfg.hidden_size)).astype(mx.bfloat16)
+    # each timed call appends 2 ctx positions (like a real round); the slight cache growth
+    # over the timing loop is negligible at ctx_len=512
+    return _bench(lambda: drafter(block, step_ctx, dcache, logits_start=1))
+
+
+def knee_width(verify_ms: dict[int, float]) -> int:
+    """The verify-cost curve's convex knee: the smallest width whose marginal cost jumps clearly
+    above the cheap region below it (MLX's quantized matmul leaving its few-rows path for GEMM
+    tiling). On this M4 Pro the knee sits at width ~4 (see NOTES "Perf pass 2"). This is the
+    machine-dependent quantity that decides dspark-vs-DFlash: a *small* knee means wide verify is
+    expensive → dspark's short blocks win (what ``--mode auto`` already picks); a knee that has
+    moved out to the DFlash block width (M5-class hardware) means DFlash full-block verify stays
+    cheap and re-enters play. Returns the top measured width if no clear knee is found."""
+    ks = sorted(verify_ms)
+    if len(ks) < 3:
+        return ks[-1] if ks else 0
+    deltas = [(ks[i], verify_ms[ks[i]] - verify_ms[ks[i - 1]]) for i in range(1, len(ks))]
+    base = deltas[0][1]
+    for w, d in deltas[1:]:
+        if d > 1.8 * max(base, 1e-6):        # marginal cost jumped clearly above the cheap region
+            return w
+        base = min(base, d)
+    return ks[-1]
+
+
+def drafter_recommendation(verify_ms: dict[int, float], dflash_block: int = 16) -> dict:
+    """Hardware-aware dspark-vs-DFlash signal from the measured verify curve. If the qmm knee is
+    below the DFlash block width, DFlash's wide-block verify is in the expensive regime → dspark
+    wins (the measured M-series answer); if the knee has moved out past it, DFlash full-block
+    re-enters play on structured content. Purely a recommendation surfaced to the user."""
+    knee = knee_width(verify_ms)
+    dflash_viable = knee >= dflash_block
+    return {"knee_width": knee, "dflash_full_block_viable": dflash_viable,
+            "recommend": "dflash-on-structured" if dflash_viable else "dspark"}
+
+
+def _interp(curve: dict[int, float], x: int) -> float:
+    """Piecewise-linear interpolation over the measured widths (extrapolates the last
+    segment's slope above the top measured width)."""
+    ks = sorted(curve)
+    if x in curve:
+        return curve[x]
+    if x <= ks[0]:
+        return curve[ks[0]]
+    if x >= ks[-1]:
+        if len(ks) == 1:
+            return curve[ks[-1]]
+        slope = (curve[ks[-1]] - curve[ks[-2]]) / (ks[-1] - ks[-2])
+        return curve[ks[-1]] + slope * (x - ks[-1])
+    for lo, hi in zip(ks, ks[1:]):
+        if lo < x < hi:
+            f = (x - lo) / (hi - lo)
+            return curve[lo] + f * (curve[hi] - curve[lo])
+    return curve[ks[-1]]  # unreachable
+
+
+# --------------------------------------------------------------------------- controller
+
+
+class CapController:
+    """Live cap picker: maximizes expected committed tokens per unit round time.
+
+    ``update(accepted_n, cap_used)`` feeds the per-position acceptance EWMA; ``cap`` is the
+    current choice. Thread-unsafe by design — generation is already serialized (one engine
+    thread), and a per-generation instance is fine too.
+    """
+
+    def __init__(self, verify_ms: dict[int, float], drafter_ms: dict[int, float] | float,
+                 max_cap: int, *, init_cap: int = 2, prior_p: float = 0.65,
+                 alpha: float = 0.02, hysteresis: float = 1.03, repick_every: int = 4):
+        self.verify_ms = {int(k): float(v) for k, v in verify_ms.items()}
+        self.drafter_ms = drafter_ms
+        self.max_cap = max(1, int(max_cap))
+        self.cap = max(1, min(init_cap, self.max_cap))
+        self.p = prior_p
+        self.alpha = alpha
+        self.hysteresis = hysteresis
+        self.repick_every = max(1, repick_every)
+        self.rounds = 0
+
+    # -- cost model --
+    def _draft_cost(self, cap: int) -> float:
+        if isinstance(self.drafter_ms, dict):
+            return _interp({int(k): float(v) for k, v in self.drafter_ms.items()}, cap)
+        return float(self.drafter_ms)
+
+    def expected_committed(self, cap: int) -> float:
+        """1 bonus/replacement token + geometric accepted prefix."""
+        return 1.0 + sum(self.p ** i for i in range(1, cap + 1))
+
+    def rate(self, cap: int) -> float:
+        """Expected committed tokens per ms of round time at this cap."""
+        t = self._draft_cost(cap) + _interp(self.verify_ms, cap + 1)
+        return self.expected_committed(cap) / max(t, 1e-6)
+
+    # -- live updates --
+    def update(self, accepted_n: int, cap_used: int) -> None:
+        """Feed one round's outcome: ``accepted_n`` drafted tokens survived out of
+        ``cap_used``. Full acceptance is censored (no failure observed)."""
+        for _ in range(accepted_n):
+            self.p += self.alpha * (1.0 - self.p)
+        if accepted_n < cap_used:
+            self.p += self.alpha * (0.0 - self.p)
+        self.rounds += 1
+        if self.rounds % self.repick_every == 0:
+            self._repick()
+
+    def _repick(self) -> None:
+        best = max(range(1, self.max_cap + 1), key=self.rate)
+        if best != self.cap and self.rate(best) > self.rate(self.cap) * self.hysteresis:
+            self.cap = best
+
+    def info(self) -> dict:
+        return {"cap": self.cap, "p": round(self.p, 3), "rounds": self.rounds,
+                "knee_width": knee_width(self.verify_ms),  # qmm knee → dspark-vs-dflash signal
+                "predicted_rates": {c: round(self.rate(c) * 1e3, 1)   # tok/s at each cap
+                                    for c in range(1, self.max_cap + 1)}}
+
+
+# --------------------------------------------------------------------------- disk cache
+
+
+def _cache_path(cache_dir: str | None = None) -> str:
+    return os.path.join(cache_dir or CACHE_DIR, CACHE_FILE)
+
+
+def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
+               ctx_len: int = CTX_LEN) -> str:
+    dev = mx.device_info().get("device_name", "unknown")
+    tgt = os.path.basename(str(target_repo).rstrip("/"))
+    drf = os.path.basename(str(drafter_repo).rstrip("/")) if drafter_repo else "-"
+    return f"v{SCHEMA}|{dev}|mlx{mx.__version__}|{mode}|{tgt}|{drf}|ctx{ctx_len}"
+
+
+def load_cached(key: str, cache_dir: str | None = None) -> dict | None:
+    try:
+        with open(_cache_path(cache_dir)) as f:
+            return json.load(f).get(key)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_cached(key: str, entry: dict, cache_dir: str | None = None) -> None:
+    path = _cache_path(cache_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    data[key] = entry
+    with open(path, "w") as f:
+        json.dump(data, f, indent=1)
+
+
+# --------------------------------------------------------------------------- entry point
+
+
+def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
+              cache_dir: str | None = None, verbose: bool = True) -> CapController:
+    """Measure (or load from the disk cache) this machine+pair's cost curves and return a
+    ready :class:`CapController`. ``mode`` is ``"dspark"`` or ``"dflash"``."""
+    cfg = drafter.config
+    if mode == "dspark":
+        max_cap = int(cfg.block_size)
+        widths = list(range(2, max_cap + 2))                    # verify width = cap + 1
+        caps = list(range(1, max_cap + 1))
+    elif mode == "dflash":
+        max_cap = int(cfg.block_size) - 1
+        widths = sorted({2, 3, 4, 5, 7, 9, 12, max_cap + 1})    # sample + interpolate
+        caps = []
+    else:
+        raise ValueError(f"auto cap supports dspark/dflash, not {mode!r}")
+
+    key = _cache_key(mode, target_repo, drafter_repo)
+    entry = load_cached(key, cache_dir)
+    if entry is None:
+        if verbose:
+            print(f"calibrating {mode} cap for this machine (one-time, cached)…", flush=True)
+        tap = list(cfg.target_layer_ids)
+        verify = measure_verify_curve(target, tap, widths)
+        if mode == "dspark":
+            drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
+        else:
+            drafter_ms = measure_dflash_drafter_cost(drafter)
+        entry = {"verify": {str(k): v for k, v in verify.items()},
+                 "drafter": ({str(k): v for k, v in drafter_ms.items()}
+                             if isinstance(drafter_ms, dict) else drafter_ms)}
+        save_cached(key, entry, cache_dir)
+        if verbose:
+            vs = " ".join(f"{k}:{v:.0f}" for k, v in sorted(verify.items()))
+            print(f"  verify ms by width: {vs}", flush=True)
+            rec = drafter_recommendation(verify)
+            print(f"  qmm knee at width {rec['knee_width']} -> "
+                  f"{'DFlash full-block viable' if rec['dflash_full_block_viable'] else 'dspark wins'} "
+                  f"(dspark-vs-dflash signal)", flush=True)
+
+    verify = {int(k): float(v) for k, v in entry["verify"].items()}
+    drafter_ms = (entry["drafter"] if not isinstance(entry["drafter"], dict)
+                  else {int(k): float(v) for k, v in entry["drafter"].items()})
+    ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2)
+    if verbose:
+        r = ctrl.info()["predicted_rates"]
+        best = max(r, key=r.get)
+        print(f"  predicted tok/s by cap (prior accept): {r} -> starting cap 2, "
+              f"knee-best {best}", flush=True)
+    return ctrl

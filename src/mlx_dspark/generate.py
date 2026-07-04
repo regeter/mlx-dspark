@@ -13,6 +13,7 @@ acceptance length (tokens committed per target forward).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
@@ -33,6 +34,8 @@ class GenResult:
     target_forwards: int
     seconds: float
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
+    lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
+    logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
 
     @property
     def mean_accept_len(self) -> float:
@@ -129,62 +132,234 @@ def eos_token_ids(tokenizer) -> set[int]:
     return ids
 
 
-def _pick(logits_row, temperature: float, top_p: float = 1.0, top_k: int = 0) -> int:
-    """argmax (temperature 0) or a temperature / top-p / top-k sample (temperature > 0)."""
+def _sample_arr(logits_row, temperature: float, top_p: float = 1.0, top_k: int = 0) -> mx.array:
+    """Chosen token as a (lazy) mx scalar: argmax at temperature 0, else a temperature /
+    top-p / top-k sample. No device sync — callers decide when to materialize."""
     if temperature > 0.0:
         probs = truncate_probs(mx.softmax(logits_row / temperature, axis=-1), top_p, top_k)
-        return int(sample_probs(probs).item())
-    return int(mx.argmax(logits_row).item())
+        return sample_probs(probs)
+    return mx.argmax(logits_row)
+
+
+def _pick(logits_row, temperature: float, top_p: float = 1.0, top_k: int = 0) -> int:
+    """argmax (temperature 0) or a temperature / top-p / top-k sample (temperature > 0)."""
+    return int(_sample_arr(logits_row, temperature, top_p, top_k).item())
+
+
+def _logprobs_for_block(logits_rows, token_ids, top_k: int) -> list[dict]:
+    """Per-token logprobs from a block of target logits ``[P, V]`` and the ``P`` tokens actually
+    committed at those positions. Returns ``[{token_id, logprob, top:[(id, logprob), …]}]`` using
+    the **raw** target log-softmax (temperature/penalty-independent — it reports the target's own
+    distribution, which is what OpenAI logprobs are read for). ``top_k`` 0 = chosen token only.
+    Gathers on-GPU (one eval per block) so it adds a small, bounded cost only when requested."""
+    x = logits_rows.astype(mx.float32)                                # stable log-softmax (max-shift)
+    m = mx.max(x, axis=-1, keepdims=True)
+    logp = x - m - mx.log(mx.sum(mx.exp(x - m), axis=-1, keepdims=True))
+    P = len(token_ids)
+    chosen = logp[mx.arange(P), mx.array(token_ids)]                   # [P]
+    top = None
+    if top_k > 0:
+        kth = min(top_k, logp.shape[-1])
+        idx = mx.argsort(-logp, axis=-1)[:, :kth]                      # [P, k] top ids per row
+        vals = mx.take_along_axis(logp, idx, axis=-1)                 # [P, k]
+        mx.eval(chosen, idx, vals)
+        top = (idx.tolist(), vals.tolist())
+    else:
+        mx.eval(chosen)
+    ch = chosen.tolist()
+    out = []
+    for i in range(P):
+        e = {"token_id": int(token_ids[i]), "logprob": float(ch[i])}
+        if top is not None:
+            e["top"] = [(int(t), float(l)) for t, l in zip(top[0][i], top[1][i])]
+        out.append(e)
+    return out
+
+
+class _Penalizer:
+    """OpenAI ``presence_penalty`` / ``frequency_penalty`` applied to the **target** logits, so
+    the greedy/spec output equals sequential decoding of the penalized target (lossless wrt the
+    penalized target — for temp>0 too: speculative sampling is exact wrt whatever distribution the
+    target logits define, so penalizing only the target ``p`` suffices; the drafter proposal ``q``
+    just loses a little acceptance). Running completion-token counts are kept incrementally.
+    Inactive (both penalties 0) → a no-op that leaves the default decode path byte-for-byte
+    unchanged. Penalized logit for token v: ``logit[v] - presence*(count[v]>0) - frequency*count[v]``
+    over the generated completion only (OpenAI semantics)."""
+
+    def __init__(self, presence: float = 0.0, frequency: float = 0.0):
+        self.presence = float(presence or 0.0)
+        self.frequency = float(frequency or 0.0)
+        self.active = bool(self.presence or self.frequency)
+        self.counts: dict[int, int] = {}
+
+    def add(self, tokens) -> None:
+        if not self.active:
+            return
+        for t in tokens:
+            t = int(t)
+            self.counts[t] = self.counts.get(t, 0) + 1
+
+    def block_penalty(self, vocab: int, draft_prefix, dtype) -> mx.array:
+        """``[len(draft_prefix)+1, vocab]`` penalty to subtract from a verify block's logits:
+        row i penalizes by the base completion counts **plus** the block's own ``draft_prefix[:i]``
+        — so the accepted prefix's (penalized) argmax matches sequential penalized decoding.
+        ``draft_prefix=[]`` gives a single ``[1, vocab]`` row (the baseline one-token case)."""
+        base = mx.zeros((vocab,), dtype=dtype)
+        if self.counts:
+            ids = mx.array(list(self.counts.keys()))
+            cs = mx.array(list(self.counts.values()), dtype=dtype)
+            base[ids] = self.presence + self.frequency * cs
+        rows = [base]
+        extra = dict(self.counts)
+        for d in draft_prefix:
+            d = int(d)
+            inc = self.frequency + (self.presence if extra.get(d, 0) == 0 else 0.0)
+            nxt = rows[-1] + 0.0
+            nxt[d] = nxt[d] + inc
+            rows.append(nxt)
+            extra[d] = extra.get(d, 0) + 1
+        return mx.stack(rows)
+
+    def apply(self, v_logits_rows, draft_prefix):
+        """Penalize target verify logits ``[M+1, V]`` in place-of; identity when inactive."""
+        if not self.active:
+            return v_logits_rows
+        return v_logits_rows - self.block_penalty(
+            v_logits_rows.shape[-1], draft_prefix, v_logits_rows.dtype)
+
+
+class StopStreaming(Exception):
+    """Raise from an ``on_text`` callback to end generation gracefully: the loop stops at
+    the next round boundary and returns a normal (partial) GenResult, leaving caches in a
+    consistent, storable state. The server uses this when a streaming client disconnects,
+    so the prefix cache survives instead of being invalidated by an error."""
+
+
+class _FullDecodeDetokenizer:
+    """Fallback detokenizer: full re-decode of all tokens on every ``.text`` access (the
+    pre-0.1.1 _Streamer behavior, O(n²) over a generation). Used only when no streaming
+    detokenizer can be built for this tokenizer (e.g. minimal test doubles)."""
+
+    def __init__(self, tokenizer):
+        self._tok = tokenizer
+        self.tokens: list[int] = []
+
+    def add_token(self, token: int) -> None:
+        self.tokens.append(token)
+
+    def finalize(self) -> None:
+        pass
+
+    @property
+    def text(self) -> str:
+        return self._tok.decode(self.tokens)
+
+
+def _make_detokenizer(tokenizer):
+    """Best available *streaming* detokenizer for this tokenizer, so streaming decodes only
+    the new tokens each round instead of re-decoding the whole output (O(n) vs O(n²) over a
+    generation — the re-decode dominated long/thinking outputs).
+
+    - mlx-lm's ``TokenizerWrapper`` (the qwen3 target path) carries one: use it.
+    - A plain HF fast tokenizer (the mlx-vlm/gemma path): pick mlx-lm's SPM/BPE streaming
+      class by inspecting the backend decoder, exactly like ``mlx_lm.tokenizer_utils.load``.
+    - Anything else falls back to full re-decode (prior behavior).
+    """
+    detok = getattr(tokenizer, "detokenizer", None)   # mlx-lm TokenizerWrapper property
+    if detok is not None:
+        return detok
+    try:
+        from mlx_lm.tokenizer_utils import (
+            BPEStreamingDetokenizer,
+            SPMStreamingDetokenizer,
+            _is_bpe_decoder,
+            _is_spm_decoder,
+            _is_spm_decoder_no_space,
+        )
+
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is not None:
+            decoder = json.loads(backend.to_str()).get("decoder") or {}
+            if _is_spm_decoder(decoder):
+                return SPMStreamingDetokenizer(tokenizer)
+            if _is_spm_decoder_no_space(decoder):
+                return SPMStreamingDetokenizer(tokenizer, trim_space=False)
+            if _is_bpe_decoder(decoder):
+                return BPEStreamingDetokenizer(tokenizer)
+    except Exception:  # noqa: BLE001 — any wrapping failure means: use the safe fallback
+        pass
+    return _FullDecodeDetokenizer(tokenizer)
 
 
 class _Streamer:
     """Round-granular text streaming + ``stop`` string detection, shared by every loop.
 
-    Each round the caller pushes the running ``out_ids``; we decode (minus eos), emit the
-    new tail via ``on_text``, and — when ``stop`` strings are configured — cut the output at
-    the earliest stop occurrence (setting ``stopped``) and never stream past it. To keep a
-    stop string that straddles two rounds from leaking, we hold back the last
-    ``max_stop - 1`` chars until it's safe (or we finish). With no stop strings and no
-    ``on_text`` this is a no-op, so the greedy/spec loops keep their exact prior behavior.
+    Each round the caller pushes the running ``out_ids``; the *new* tokens are fed to a
+    streaming detokenizer (so each update decodes only what's new — O(n) over a generation),
+    the new tail is emitted via ``on_text``, and — when ``stop`` strings are configured —
+    the output is cut at the earliest stop occurrence (setting ``stopped``). Stop strings are
+    scanned incrementally with a ``max_stop - 1`` lookback so one straddling two rounds is
+    still caught, and emission holds back the last ``max_stop - 1`` chars until it's safe (or
+    we finish). With no stop strings and no ``on_text`` this is a no-op, so the greedy/spec
+    loops keep their exact prior behavior.
     """
 
     def __init__(self, tokenizer, eos_ids: set[int], on_text, stop):
-        self.tok = tokenizer
         self.eos = eos_ids
         self.on_text = on_text
         self.stop = [s for s in (stop or []) if s]
         self.max_stop = max((len(s) for s in self.stop), default=0)
-        self.streamed = 0
+        self.detok = (
+            _make_detokenizer(tokenizer) if (on_text is not None or self.stop) else None
+        )
+        self.n_fed = 0        # how many of out_ids have been fed to the detokenizer
+        self.scan_from = 0    # text index the incremental stop-scan resumes at
+        self.streamed = 0     # chars already emitted via on_text
         self.text = ""
         self.stopped = False  # a stop string was hit -> caller should end the loop
 
     def update(self, out_ids: list[int]) -> None:
-        if self.on_text is None and not self.stop:
+        if self.detok is None or self.stopped:
             return
-        disp = [t for t in out_ids if t not in self.eos]
-        full = self.tok.decode(disp)
-        cut = None
-        for s in self.stop:
-            i = full.find(s)
-            if i != -1:
-                cut = i if cut is None else min(cut, i)
-        if cut is not None:
-            full = full[:cut]
-            self.stopped = True
-        self.text = full
-        if self.on_text is None:
-            return
-        emit_to = len(full)
-        if not self.stopped and self.max_stop > 1:
-            emit_to = max(self.streamed, len(full) - (self.max_stop - 1))
-        if emit_to > self.streamed:
-            self.on_text(full[self.streamed:emit_to])
-            self.streamed = emit_to
+        for t in out_ids[self.n_fed:]:
+            if t not in self.eos:
+                self.detok.add_token(t)
+        self.n_fed = len(out_ids)
+        self._advance(final=False)
 
     def flush(self) -> None:
-        if self.on_text is not None and len(self.text) > self.streamed:
-            self.on_text(self.text[self.streamed:])
-            self.streamed = len(self.text)
+        if self.detok is None or self.stopped:
+            return
+        self.detok.finalize()
+        self._advance(final=True)
+
+    def _advance(self, final: bool) -> None:
+        text = self.detok.text
+        if self.stop:
+            cut = None
+            for s in self.stop:
+                i = text.find(s, self.scan_from)
+                if i != -1:
+                    cut = i if cut is None else min(cut, i)
+            if cut is not None:
+                text = text[:cut]
+                self.stopped = True
+            else:
+                self.scan_from = max(0, len(text) - (self.max_stop - 1))
+        self.text = text
+        if self.on_text is None:
+            return
+        emit_to = len(text)
+        if not (self.stopped or final) and self.max_stop > 1:
+            emit_to = max(self.streamed, len(text) - (self.max_stop - 1))
+        if emit_to > self.streamed:
+            try:
+                self.on_text(text[self.streamed:emit_to])
+            except StopStreaming:
+                self.on_text = None      # nobody is listening; stop emitting
+                self.stopped = True      # -> loops end at the next boundary, GenResult is normal
+                return
+            self.streamed = emit_to
 
 
 def _finish_reason(out_ids: list[int], max_new_tokens: int, last_tok: int,
@@ -207,6 +382,9 @@ def greedy_generate(
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    logprobs: int | None = None,
     seed: int | None = None,
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
@@ -215,6 +393,7 @@ def greedy_generate(
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
     the spec path so a temp>0 A/B compares like-for-like). Streams via on_text.
+    ``presence_penalty`` / ``frequency_penalty`` (OpenAI) penalize the completion's own tokens.
 
     ``prompt_ids`` overrides ``prompt`` with a pre-tokenized prompt (the server passes a full
     multi-turn transcript this way); ``stop`` adds string stop-sequences (OpenAI ``stop``)."""
@@ -230,16 +409,45 @@ def greedy_generate(
 
     t0 = time.time()
     suffix = ids[reuse_len:] if reuse_len else ids      # only prefill past the reused prefix
-    logits = target_model.plain(mx.array([suffix]), cache)
-    nxt = _pick(logits[0, -1], temperature, top_p, top_k)
-    out_ids = [nxt]
+    logits = _prefill_plain(target_model, suffix, cache)
+    out_ids: list[int] = []
+    pen = _Penalizer(presence_penalty, frequency_penalty)
+    lp_list: list | None = [] if logprobs is not None else None
 
-    st.update(out_ids)
-    while (len(out_ids) < max_new_tokens and nxt not in eos_ids and not st.stopped):
-        logits = target_model.plain(mx.array([[nxt]]), cache)
-        nxt = _pick(logits[0, -1], temperature, top_p, top_k)
-        out_ids.append(nxt)
-        st.update(out_ids)
+    if pen.active or logprobs is not None:
+        # Sequential decode: needed when penalties are on (penalty state must include the just-
+        # emitted token before predicting the next) or logprobs are requested (we read each
+        # committed token's logits row). The fast pipeline below stays the default path.
+        logits_row = logits[0, -1]
+        while True:
+            pen0 = (pen.block_penalty(logits_row.shape[-1], [], logits_row.dtype)[0]
+                    if pen.active else 0.0)
+            nxt = int(_sample_arr(logits_row - pen0, temperature, top_p, top_k).item())
+            out_ids.append(nxt)
+            pen.add([nxt])
+            if lp_list is not None:
+                lp_list.extend(_logprobs_for_block(logits_row[None, :], [nxt], logprobs))
+            st.update(out_ids)
+            if len(out_ids) >= max_new_tokens or nxt in eos_ids or st.stopped:
+                break
+            logits_row = target_model.plain(mx.array([[nxt]]), cache)[0, -1]
+    else:
+        # Pipelined decode (mlx-lm style): schedule step t+1 on the GPU *before* syncing on
+        # step t's token, so detokenize/emit overlaps GPU compute instead of serializing with
+        # it. The one forward scheduled past the final token is wasted work; the cache being a
+        # token ahead is harmless (prefix reuse trims to the recorded token count).
+        y = _sample_arr(logits[0, -1], temperature, top_p, top_k)
+        mx.async_eval(y)
+        while True:
+            logits = target_model.plain(y.reshape(1, 1), cache)
+            y_next = _sample_arr(logits[0, -1], temperature, top_p, top_k)
+            mx.async_eval(y_next)
+            nxt = int(y.item())
+            out_ids.append(nxt)
+            st.update(out_ids)
+            if len(out_ids) >= max_new_tokens or nxt in eos_ids or st.stopped:
+                break
+            y = y_next
     st.flush()
 
     secs = time.time() - t0
@@ -253,6 +461,7 @@ def greedy_generate(
         target_forwards=len(out_ids),
         seconds=secs,
         finish_reason=_finish_reason(out_ids, max_new_tokens, nxt, eos_ids, st),
+        logprobs=lp_list,
     )
 
 
@@ -265,6 +474,7 @@ def dflash_generate(
     prompt_ids: list[int] | None = None,
     max_new_tokens: int = 128,
     max_draft_tokens: int | None = None,
+    cap_controller=None,
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 0,
@@ -300,7 +510,8 @@ def dflash_generate(
     bs = int(cfg.block_size)
     mask_id = int(cfg.mask_token_id)
     kdraft = bs - 1
-    cap = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
+    cap_ceiling = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
+    cap = cap_ceiling
     eos_ids = eos_token_ids(tokenizer)
 
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
@@ -310,8 +521,8 @@ def dflash_generate(
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
-    # prefill
-    logits, fused = _run_target(target_model, mx.array([ids]), cache, tap)
+    # prefill (chunked; DFlash's first draft call consumes the whole prompt's fused states)
+    logits, fused = _prefill_tapped(target_model, ids, cache, tap)
     pending_ctx = fused                                # fused hidden appended to draft ctx next round
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
@@ -323,34 +534,42 @@ def dflash_generate(
         # ---- draft full-width block; feeding pending_ctx appends exactly the just-
         # committed positions to the draft KV cache (DFlash caches only ctx KV, never
         # block KV) -> correct absolute RoPE offsets, no trim needed.
+        if cap_controller is not None:
+            cap = max(1, min(cap_controller.cap, cap_ceiling))
         block = mx.array([[pending] + [mask_id] * (bs - 1)])
         head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]  # [cap, V] mask logits
         if temperature > 0.0:
+            # two-phase: the accept test needs the q distributions on hand
             q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
             draft_arr = sample_probs(q_probs)
             mx.eval(draft_arr, q_probs)
-        else:
-            draft_arr = mx.argmax(head, axis=-1)
-            mx.eval(draft_arr)
-            q_probs = None
-        drafted = [int(x) for x in draft_arr.tolist()]
+            drafted = [int(x) for x in draft_arr.tolist()]
 
-        # ---- verify ----
-        verify_ids = mx.array([[pending] + drafted])
-        v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
-        mx.eval(v_logits, v_fused)
-        target_forwards += 1
+            verify_ids = mx.array([[pending] + drafted])
+            v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+            mx.eval(v_logits, v_fused)
 
-        if temperature > 0.0:
             n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature, top_p, top_k)
             committed = drafted[:n] + [repl]             # accepted prefix + residual/bonus
         else:
-            tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
-            n = 0
-            while n < len(drafted) and drafted[n] == tt[n]:
-                n += 1
+            # fused greedy path: draft + verify + accept reach the device as one graph with
+            # a single sync per round (see speculative_generate for the same pattern).
+            draft_arr = mx.argmax(head, axis=-1)
+            verify_ids = mx.concatenate(
+                [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+            v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+            tt_arr = mx.argmax(v_logits[0], axis=-1)
+            match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
+            n_arr = mx.cumprod(match).sum()
+            mx.eval(n_arr, tt_arr, draft_arr)
+            n = int(n_arr.item())
+            drafted = draft_arr.tolist()
+            tt = tt_arr.tolist()
             committed = drafted[:n] + [tt[n]]            # accepted prefix + bonus
+        target_forwards += 1
         accept_lengths.append(len(committed))
+        if cap_controller is not None:
+            cap_controller.update(n, len(drafted))
 
         # ---- update target cache + draft ctx ----
         trim = len(drafted) - n
@@ -364,7 +583,7 @@ def dflash_generate(
             out_ids.append(tok)
             if tok in eos_ids:
                 break
-        pending = committed[-1]
+        pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
     st.flush()
 
@@ -391,6 +610,52 @@ def _run_target(target, ids: mx.array, cache, tap: list[int]):
     return target.run(ids, cache, tap)
 
 
+PREFILL_CHUNK = 2048  # long prompts prefill in pieces so activations (especially the
+# [L, vocab] logits) stay bounded, with mx.clear_cache() between pieces. Prompts within one
+# chunk take exactly the old single-forward path, and a chunked prefill is the same cached
+# multi-pass forward the verify rounds already use (lossless to the usual fp-tie standard).
+
+
+def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None):
+    """Chunked no-tap prefill; returns the last chunk's logits."""
+    chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    logits = None
+    many = len(ids) > chunk
+    for i in range(0, len(ids), chunk):
+        logits = target.plain(mx.array([ids[i:i + chunk]]), cache)
+        if many:
+            mx.eval(logits)
+            mx.clear_cache()
+    return logits
+
+
+def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches=None,
+                    ctx_offset: int = 0, chunk: int | None = None):
+    """Chunked prefill with the hidden-state tap. When ``drafter`` is given, each chunk's
+    fused states feed the drafter context immediately (so a long prompt's fused activations
+    never all materialize at once); returns (last logits, last chunk's fused). Without a
+    drafter the fused chunks are concatenated (DFlash needs the whole prompt's fused)."""
+    chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    logits = fused = None
+    parts = []
+    pos = ctx_offset
+    many = len(ids) > chunk
+    for i in range(0, len(ids), chunk):
+        piece = ids[i:i + chunk]
+        logits, fused = target.run(mx.array([piece]), cache, tap)
+        if drafter is not None:
+            drafter.update_context(fused, ctx_offset=pos, ctx_caches=ctx_caches)
+        else:
+            parts.append(fused)
+        pos += len(piece)
+        if many:
+            mx.eval(logits, *([c.k for c in ctx_caches] if ctx_caches else [fused]))
+            mx.clear_cache()
+    if drafter is None:
+        fused = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+    return logits, fused
+
+
 def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=0):
     """Speculative-sampling acceptance (Leviathan/Chen 2023) for one verified block.
 
@@ -412,12 +677,8 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=
     qd = q_probs[rows, idx]                                    # draft prob it was sampled from
     u = mx.random.uniform(shape=(L,))
     accepted = u < mx.minimum(1.0, pd / mx.maximum(qd, 1e-9))
-    mx.eval(accepted)
-    n = 0
-    for a in accepted.tolist():
-        if not a:
-            break
-        n += 1
+    # accepted-prefix length in-graph (cumprod stops at the first reject)
+    n = int(mx.cumprod(accepted.astype(mx.int32)).sum().item())
     if n < L:
         resid = mx.maximum(p[n] - q_probs[n], 0.0)            # residual at the rejected position
         resid = resid / mx.maximum(resid.sum(), 1e-9)
@@ -440,9 +701,15 @@ def speculative_generate(
     max_new_tokens: int = 128,
     confidence_threshold: float = 0.0,
     max_draft_tokens: int | None = 2,
+    cap_controller=None,
+    lookup_drafts: bool = True,
+    lookup_max_draft: int = 6,
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    logprobs: int | None = None,
     seed: int | None = None,
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
@@ -467,6 +734,18 @@ def speculative_generate(
     draft token rarely survives, so cap=2 is the measured optimum (the drafter only runs
     lm_head/markov over these ``cap`` positions). ``None`` = full block. ``confidence_threshold``
     > 0 truncates the block adaptively via the drafter's confidence head (cumulative survival).
+
+    ``cap_controller`` (a :class:`~mlx_dspark.calibrate.CapController`) picks the cap per
+    round from this machine's measured cost curves + a live acceptance estimate, within
+    ``max_draft_tokens``'s ceiling. The cap only affects speed, never output (the target
+    verifies every token), so adapting it mid-generation stays lossless.
+
+    ``lookup_drafts`` (hybrid drafting, on by default): when the current suffix n-gram
+    already occurred earlier in the context (a copy run — quoting, code edits, repeats),
+    that free continuation (up to ``lookup_max_draft`` tokens) is verified *instead of*
+    running the drafter this round; otherwise the DSpark block drafts as usual. Verification
+    is unchanged either way, so this composes losslessly — it just lets copy-heavy spans
+    commit ~6 tokens/round where the drafter block would cap out at ~2-3.
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -474,7 +753,8 @@ def speculative_generate(
     tap = list(cfg.target_layer_ids)
     k = cfg.block_size
     mask_id = cfg.mask_token_id
-    cap = k if max_draft_tokens is None else max(1, min(max_draft_tokens, k))
+    cap_ceiling = k if max_draft_tokens is None else max(1, min(max_draft_tokens, k))
+    cap = cap_ceiling
 
     eos_ids = eos_token_ids(tokenizer)
 
@@ -492,78 +772,158 @@ def speculative_generate(
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
-    # --- prefill (only the suffix past any reused prefix) ---
+    # --- prefill (only the suffix past any reused prefix; chunked, feeding the drafter
+    # context per chunk so long prompts never materialize all fused states at once) ---
     suffix = ids[reuse_len:] if reuse_len else ids
-    logits, fused = _run_target(target_model, mx.array([suffix]), cache, tap)
+    logits, _ = _prefill_tapped(target_model, suffix, cache, tap,
+                                drafter=drafter, ctx_caches=ctx_caches, ctx_offset=reuse_len)
     n_cached = len(ids)
-    drafter.update_context(fused, ctx_offset=reuse_len, ctx_caches=ctx_caches)
     pending = _pick(logits[0, -1], temperature, top_p, top_k)  # first committed token
-    mx.eval([c.k for c in ctx_caches])
+    mx.async_eval([c.k for c in ctx_caches])   # schedule; round 1's sync will wait on it
+    pen = _Penalizer(presence_penalty, frequency_penalty)      # OpenAI presence/frequency penalties
+    pen.add([pending])
+    lp_list: list | None = [] if logprobs is not None else None
+    if lp_list is not None:                                    # first token came from prefill logits
+        lp_list.extend(_logprobs_for_block(logits[0, -1][None, :], [pending], logprobs))
+
+    index = None
+    if lookup_drafts:
+        from .lookup import NGramIndex     # deferred: lookup.py imports this module
+
+        # Hybrid uses a stricter 4-gram minimum than pure lookup mode: here a spurious hit
+        # doesn't just cost a wider verify — it forgoes a productive drafter round (~2.3
+        # tokens). Trigrams fired on ~4-10% of chat rounds (measured 2-6% slower); 4-grams
+        # almost never fire spuriously, while genuine copying has them in abundance.
+        index = NGramIndex(min_n=4, max_n=5, max_draft=max(1, lookup_max_draft))
+        index.extend(ids + [pending])
 
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
     target_forwards = 1
+    lookup_rounds = 0
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
-        # ---- 1. draft a block ----
-        # The backbone runs full-width: block attention is bidirectional, so each
-        # position's hidden depends on the whole block, and shrinking it would change
-        # the distribution the drafter was trained on. But we only ever *verify* `cap`
-        # tokens, so run the lm_head and the sequential markov head over just the first
-        # `cap` positions instead of all `k` — the rest used to be computed and thrown
-        # away every round (the dominant slice of drafter time at small caps).
-        block_ids = [pending] + [mask_id] * (k - 1)
-        noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
-        block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
-        head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
-        base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
-        if temperature > 0.0:
-            draft_arr, q_probs = drafter.sample_block_probs(
-                base_logits, pending, temperature, top_p, top_k)
-            mx.eval(draft_arr, q_probs)
+        lk_draft = index.propose() if index is not None else []
+        use_conf = confidence_threshold > 0.0 and drafter.confidence_head is not None
+        if lk_draft:
+            # ---- free lookup draft (a copy run was detected): verify the continuation of
+            # the earlier occurrence instead of running the drafter this round. The drafter
+            # context still updates below (from v_fused), so drafter rounds stay correct.
+            lookup_rounds += 1
+            draft = lk_draft
+            if temperature > 0.0:
+                verify_ids = mx.array([[pending] + draft])
+                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                mx.eval(v_logits, v_fused)
+                vocab = v_logits.shape[-1]     # point-mass proposal: q is one-hot per token
+                q_probs = (mx.arange(vocab)[None, :]
+                           == mx.array(draft)[:, None]).astype(mx.float32)
+                n, repl = _spec_sample_accept(
+                    pen.apply(v_logits[0], draft), draft, q_probs, temperature, top_p, top_k)
+                committed = draft[:n] + [repl]
+            else:
+                draft_arr = mx.array(draft)
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                tt_arr = mx.argmax(pen.apply(v_logits[0], draft), axis=-1)
+                match = (draft_arr
+                         == tt_arr[: len(draft)].astype(draft_arr.dtype)).astype(mx.int32)
+                n_arr = mx.cumprod(match).sum()
+                mx.eval(n_arr, tt_arr)
+                n = int(n_arr.item())
+                tt = tt_arr.tolist()
+                committed = draft[:n] + [tt[n]]
         else:
-            draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
-            mx.eval(draft_arr)
-            q_probs = None
-        draft = [int(x) for x in draft_arr.tolist()]
+            # ---- 1. draft a block ----
+            # The backbone runs full-width: block attention is bidirectional, so each
+            # position's hidden depends on the whole block, and shrinking it would change
+            # the distribution the drafter was trained on. But we only ever *verify* `cap`
+            # tokens, so run the lm_head and the sequential markov head over just the first
+            # `cap` positions instead of all `k` — the rest used to be computed and thrown
+            # away every round (the dominant slice of drafter time at small caps).
+            if cap_controller is not None:
+                cap = max(1, min(cap_controller.cap, cap_ceiling))
+            block_ids = [pending] + [mask_id] * (k - 1)
+            noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
+            block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
+            head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
+            base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
 
-        # optional confidence-based truncation (adaptive block length, within cap).
-        # Paper §3.2.1: c_k is the *conditional* survival prob of position k given the
-        # prefix accepted; the prefix survival prob is the cumulative product
-        # a_j = ∏_{i<=j} c_i (Eq 7-8). Keep extending the draft while a_j stays above
-        # the threshold, i.e. while the next token is still likely to survive verify.
-        if confidence_threshold > 0.0 and drafter.confidence_head is not None:
-            prev_tokens = mx.array([pending] + draft[:-1])
-            conf = mx.sigmoid(drafter.confidence_logits(head_hidden[0], prev_tokens))
-            mx.eval(conf)
-            surv, keep = 1.0, 0
-            for i, c in enumerate(conf.tolist()):
-                surv *= c
-                if surv < confidence_threshold:
-                    break
-                keep = i + 1
-            draft = draft[:keep]
-        if not draft:
-            draft = [int(draft_arr[0].item())]  # always propose >=1 (q_probs[0] still aligns)
+            if temperature > 0.0 or use_conf or pen.active:
+                # Two-phase path: the sampled path needs the q distributions, the confidence head
+                # truncates the draft, and penalties need the draft as a list (to penalize each
+                # verify position by the base counts + its draft prefix) — so the drafted tokens
+                # are materialized *before* the verify forward, one extra sync per round.
+                if temperature > 0.0:
+                    draft_arr, q_probs = drafter.sample_block_probs(
+                        base_logits, pending, temperature, top_p, top_k)
+                    mx.eval(draft_arr, q_probs)
+                else:
+                    draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
+                    mx.eval(draft_arr)
+                    q_probs = None
+                draft = [int(x) for x in draft_arr.tolist()]
 
-        # ---- 2. verify with the target ----
-        verify_ids = mx.array([[pending] + draft])             # [1, 1+len(draft)]
-        v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
-        mx.eval(v_logits, v_fused)
+                # optional confidence-based truncation (adaptive block length, within cap).
+                # Paper §3.2.1: c_k is the *conditional* survival prob of position k given
+                # the prefix accepted; the prefix survival prob is the cumulative product
+                # a_j = ∏_{i<=j} c_i (Eq 7-8). Keep extending the draft while a_j stays
+                # above the threshold, i.e. while the next token likely survives verify.
+                if use_conf:
+                    prev_tokens = mx.array([pending] + draft[:-1])
+                    conf = mx.sigmoid(drafter.confidence_logits(head_hidden[0], prev_tokens))
+                    mx.eval(conf)
+                    surv, keep = 1.0, 0
+                    for i, c in enumerate(conf.tolist()):
+                        surv *= c
+                        if surv < confidence_threshold:
+                            break
+                        keep = i + 1
+                    draft = draft[:keep]
+                if not draft:
+                    draft = [int(draft_arr[0].item())]  # always propose >=1 (q_probs[0] aligns)
+
+                # ---- 2. verify with the target ----
+                verify_ids = mx.array([[pending] + draft])     # [1, 1+len(draft)]
+                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                mx.eval(v_logits, v_fused)
+
+                # ---- 3. accept ----
+                if temperature > 0.0:
+                    n, repl = _spec_sample_accept(
+                        pen.apply(v_logits[0], draft), draft, q_probs, temperature, top_p, top_k)
+                    committed = draft[:n] + [repl]             # accepted prefix + residual/bonus
+                else:
+                    tt = [int(x) for x in mx.argmax(pen.apply(v_logits[0], draft), axis=-1).tolist()]
+                    n = 0
+                    while n < len(draft) and draft[n] == tt[n]:
+                        n += 1
+                    committed = draft[:n] + [tt[n]]            # accepted prefix + bonus
+            else:
+                # Fused greedy path (the default). The drafted tokens never round-trip to
+                # the CPU before verify: verify_ids is assembled on-GPU and the accepted-
+                # prefix length is computed in-graph (cumprod of positionwise argmax
+                # matches), so the whole round — draft heads + verify forward + accept —
+                # reaches the device as one batched graph with a single sync.
+                draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                tt_arr = mx.argmax(v_logits[0], axis=-1)
+                match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
+                n_arr = mx.cumprod(match).sum()
+                mx.eval(n_arr, tt_arr, draft_arr)
+                n = int(n_arr.item())
+                draft = draft_arr.tolist()
+                tt = tt_arr.tolist()
+                committed = draft[:n] + [tt[n]]                # accepted prefix + bonus
         target_forwards += 1
-
-        # ---- 3. accept ----
-        if temperature > 0.0:
-            n, repl = _spec_sample_accept(v_logits[0], draft, q_probs, temperature, top_p, top_k)
-            committed = draft[:n] + [repl]                     # accepted prefix + residual/bonus
-        else:
-            tt = [int(x) for x in mx.argmax(v_logits[0], axis=-1).tolist()]
-            n = 0
-            while n < len(draft) and draft[n] == tt[n]:
-                n += 1
-            committed = draft[:n] + [tt[n]]                    # accepted prefix + bonus
         accept_lengths.append(len(committed))
+        if cap_controller is not None and not lk_draft:
+            # only drafter rounds inform the cap (lookup drafts have their own acceptance)
+            cap_controller.update(n, len(draft))
 
         # ---- 4. update caches/context ----
         trim = len(draft) - n
@@ -576,17 +936,28 @@ def speculative_generate(
             v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches
         )
         n_cached = n_cached + n + 1
-        mx.eval([c.k for c in ctx_caches])
+        # schedule (don't block): the ctx projections run while Python commits tokens and
+        # streams text; the next round's single sync waits on them anyway.
+        mx.async_eval([c.k for c in ctx_caches])
 
+        appended = []
         for tok in committed:
             out_ids.append(tok)
+            appended.append(tok)
             if tok in eos_ids:
                 break
-        pending = committed[-1]
+        pen.add(appended)
+        if lp_list is not None and appended:
+            # raw target logits at the committed verify positions (0..len(appended)-1)
+            lp_list.extend(_logprobs_for_block(v_logits[0][:len(appended)], appended, logprobs))
+        if index is not None:
+            index.extend(appended)
+        pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
 
         if verbose:
-            print(f"  round {len(accept_lengths):3d}: drafted {len(draft)}, "
+            src = "lookup" if lk_draft else "drafter"
+            print(f"  round {len(accept_lengths):3d}: {src} drafted {len(draft)}, "
                   f"accepted {n}, committed {len(committed)}")
     st.flush()
 
@@ -602,4 +973,6 @@ def speculative_generate(
         target_forwards=target_forwards,
         seconds=secs,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
+        lookup_rounds=lookup_rounds,
+        logprobs=lp_list,
     )

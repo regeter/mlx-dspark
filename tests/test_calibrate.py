@@ -1,0 +1,111 @@
+"""Model-free tests for the auto-cap machinery: interpolation, the acceptance EWMA,
+cap choice against synthetic (measured-shaped) cost curves, and the disk cache."""
+
+from __future__ import annotations
+
+from mlx_dspark.calibrate import (
+    CapController,
+    _cache_key,
+    _interp,
+    load_cached,
+    save_cached,
+)
+
+
+def test_interp_exact_between_and_extrapolate():
+    curve = {2: 10.0, 4: 20.0, 8: 60.0}
+    assert _interp(curve, 2) == 10.0
+    assert _interp(curve, 3) == 15.0            # linear between 2 and 4
+    assert _interp(curve, 1) == 10.0            # clamped below
+    assert _interp(curve, 10) == 80.0           # extrapolates the last slope (10/step)
+    assert _interp({3: 7.0}, 9) == 7.0          # single point -> constant
+
+
+def _gemma_like_controller(**kw):
+    # measured M4 Pro shape: ~flat to width 3, knee at 4 (NOTES "Perf pass 2")
+    verify = {2: 62.5, 3: 67.6, 4: 86.4, 5: 105.6, 6: 124.8, 7: 144.0, 8: 163.2}
+    drafter = {c: 7.0 + 0.5 * c for c in range(1, 8)}
+    return CapController(verify, drafter, max_cap=7, **kw)
+
+
+def test_controller_prefers_pre_knee_cap_at_typical_acceptance():
+    ctrl = _gemma_like_controller()
+    ctrl.p = 0.65                                # ~measured chat acceptance
+    best = max(range(1, 8), key=ctrl.rate)
+    assert best in (1, 2, 3)                     # never past the knee at this acceptance
+    # near-perfect acceptance should justify crossing the knee
+    ctrl.p = 0.99
+    assert max(range(1, 8), key=ctrl.rate) >= 4
+
+
+def test_controller_ewma_and_censoring():
+    ctrl = _gemma_like_controller(alpha=0.5)
+    p0 = ctrl.p
+    ctrl.update(accepted_n=2, cap_used=2)        # full acceptance: successes only (censored)
+    assert ctrl.p > p0
+    p1 = ctrl.p
+    ctrl.update(accepted_n=0, cap_used=2)        # immediate reject: one failure
+    assert ctrl.p < p1
+
+
+def test_controller_repick_moves_cap_with_hysteresis():
+    ctrl = _gemma_like_controller(alpha=0.4, repick_every=1)
+    ctrl.cap = 4                                 # start past the knee on purpose
+    for _ in range(20):
+        ctrl.update(accepted_n=0, cap_used=ctrl.cap)   # rejections -> low p
+    assert ctrl.cap <= 2                         # migrates below the knee
+    for _ in range(60):
+        ctrl.update(accepted_n=ctrl.cap, cap_used=ctrl.cap)   # perfect acceptance
+    assert ctrl.cap >= 4                         # climbs back over the knee
+
+
+def test_controller_update_at_any_cap_feeds_one_estimate():
+    a = _gemma_like_controller(alpha=0.3)
+    b = _gemma_like_controller(alpha=0.3)
+    a.update(2, 2)
+    a.update(1, 2)
+    b.update(2, 4)                               # same successes at a different cap...
+    b.update(1, 4)                               # ...but observed failures differ (censoring)
+    assert a.p != b.p                            # cap_used matters only via the failure obs
+    c = _gemma_like_controller(alpha=0.3)
+    c.update(2, 2)
+    c.update(1, 1)                               # full accept at cap1 == success, censored
+    assert c.p > 0.65
+
+
+def test_disk_cache_roundtrip(tmp_path):
+    key = _cache_key("dspark", "org/Model-8bit", "org/drafter")
+    assert "dspark" in key and "Model-8bit" in key
+    entry = {"verify": {"2": 10.0}, "drafter": {"1": 3.0}}
+    assert load_cached(key, str(tmp_path)) is None
+    save_cached(key, entry, str(tmp_path))
+    assert load_cached(key, str(tmp_path)) == entry
+    save_cached("other", {"verify": {}}, str(tmp_path))   # merge keeps the first entry
+    assert load_cached(key, str(tmp_path)) == entry
+
+
+def test_knee_width_convex_curve():
+    from mlx_dspark.calibrate import knee_width
+    # cheap 1..3 (+5/step), then a jump at width 4 (+19) — the qmm knee
+    assert knee_width({1: 5, 2: 10, 3: 15, 4: 34, 5: 53}) == 4
+
+
+def test_knee_width_linear_no_knee():
+    from mlx_dspark.calibrate import knee_width
+    assert knee_width({1: 5, 2: 10, 3: 15, 4: 20, 5: 25}) == 5   # no jump -> top width
+
+
+def test_drafter_recommendation_small_knee_is_dspark():
+    from mlx_dspark.calibrate import drafter_recommendation
+    rec = drafter_recommendation({1: 5, 2: 10, 3: 15, 4: 34, 5: 53}, dflash_block=16)
+    assert rec["knee_width"] == 4 and not rec["dflash_full_block_viable"]
+    assert rec["recommend"] == "dspark"
+
+
+def test_drafter_recommendation_wide_knee_reopens_dflash():
+    from mlx_dspark.calibrate import drafter_recommendation
+    # a hypothetical M5-class curve: cheap all the way to width ~18
+    curve = {w: 5.0 + 0.2 * w for w in range(1, 18)}
+    curve[18] = curve[17] + 20.0
+    rec = drafter_recommendation(curve, dflash_block=16)
+    assert rec["dflash_full_block_viable"] and rec["recommend"] == "dflash-on-structured"
