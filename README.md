@@ -128,9 +128,16 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 
 *Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache); add headroom for macOS.
 A 4-bit target (`--model …-it-4bit`) roughly halves the target's share (fits smaller Macs). **Use the
-matched *instruct* target** the drafter was trained against — a base model drops acceptance sharply.
-`--drafter` lets you run any other matched z-lab / DeepSpec checkpoint (e.g. Qwen3-14B) with no code change.
-The legacy `--family qwen3|gemma4` flags still work but are deprecated in favor of `--model`.
+matched *instruct* target** the drafter was trained against — a base model drops acceptance sharply. The
+legacy `--family qwen3|gemma4` flags still work but are deprecated in favor of `--model`.
+
+`--drafter` lets you run **any** other matched z-lab / DeepSpec checkpoint with no code change — e.g.
+**Qwen3-14B** (DSpark-only; z-lab published no 14B DFlash; ~18 GB peak; benchmarked below):
+
+```bash
+mlx-dspark generate --model mlx-community/Qwen3-14B-8bit \
+  --drafter deepseek-ai/dspark_qwen3_14b_block7 --prompt "Explain how rainbows form."
+```
 
 ## How it works
 
@@ -171,6 +178,7 @@ reasoning are in [Benchmarks & deep dive](#benchmarks--deep-dive).
 | target | accept len | baseline (official) | mlx-dspark | speedup |
 |---|---|---|---|---|
 | **Gemma-4 12B** | ~2.5  | 18.4 tok/s | ~30 tok/s | **~1.6×** (≤2× on code/math) |
+| **Qwen3-14B**   | ~2.36 | 15.7 tok/s | ~26 tok/s | **~1.6×** (up to ~1.75× on code) |
 | **Qwen3-8B**    | ~2.44 | 29.4 tok/s | ~47 tok/s | **~1.6×** |
 | **Qwen3-4B**    | ~2.25 | 52.9 tok/s | ~73 tok/s | **~1.4×** |
 
