@@ -109,3 +109,23 @@ def test_drafter_recommendation_wide_knee_reopens_dflash():
     curve[18] = curve[17] + 20.0
     rec = drafter_recommendation(curve, dflash_block=16)
     assert rec["dflash_full_block_viable"] and rec["recommend"] == "dflash-on-structured"
+
+
+def test_cap_for_shrinks_under_batched_grid():
+    from mlx_dspark.calibrate import CapController
+    # single-stream curve: modest slope; B=4 grid: wide verify much pricier -> cap shrinks
+    verify = {2: 20.0, 3: 25.0, 4: 40.0, 5: 60.0}
+    grid = {"4": {"2": 60.0, "3": 90.0, "4": 130.0, "5": 170.0}}  # str keys, as disk-cached
+    c = CapController(verify, 5.0, max_cap=4, verify_grid=grid)
+    assert c.cap_for(1) == c.cap                     # no batch -> live single-stream cap
+    assert c.cap_for(4) == 1                         # argmax under the pricier B=4 curve
+    assert c.cap_for(2) == 1                         # nearest measured B >= 2 is 4
+    assert c.cap_for(9) == 1                         # beyond the grid -> top measured B
+    assert c.info()["batch_caps"] == {4: 1}
+
+
+def test_cap_for_without_grid_falls_back():
+    from mlx_dspark.calibrate import CapController
+    c = CapController({2: 20.0, 3: 25.0}, 5.0, max_cap=4)
+    assert c.cap_for(4) == c.cap
+    assert "batch_caps" not in c.info()

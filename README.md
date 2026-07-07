@@ -47,7 +47,10 @@ drafter is resolved automatically for known targets (see [Models](#models)), or 
 
 ```bash
 mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0.1:8080/v1
-#   --max-batch 4   serve up to 4 concurrent requests in one batched pass (~2.5× aggregate)
+#   --max-batch 4   continuous batching: up to 4 concurrent requests share each forward
+#                   (~2.5× aggregate; a finished request returns immediately, its slot
+#                   admits the next one mid-flight)
+#   --kv-bits 8     quantized KV cache (long-context bandwidth saver)
 #   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
 ```
 
@@ -139,6 +142,26 @@ mlx-dspark generate --model mlx-community/Qwen3-14B-8bit \
   --drafter deepseek-ai/dspark_qwen3_14b_block7 --prompt "Explain how rainbows form."
 ```
 
+### Bring your own drafter — what runs and what doesn't
+
+New DSpark/DFlash drafters keep landing on HF in **three different packagings**; here is the honest
+compatibility contract (loaders refuse incompatible checkpoints with an error naming the reason, never
+a silent mis-load):
+
+| checkpoint style | example | status |
+|---|---|---|
+| **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_14b_block7` | ✅ runs via `--drafter` (4B/8B/14B/gemma-12B measured on an M4 Pro; larger sizes should run — reports welcome) |
+| **z-lab DFlash adapter** for a qwen3/gemma4-family target | `z-lab/Qwen3-8B-DFlash-b16` | ✅ runs via `--mode dflash --drafter` |
+| **vLLM "speculators" format** | `RedHatAI/GLM-5.2-speculator.dspark` | ❌ different config schema — not yet ([issue?](https://github.com/ARahim3/mlx-dspark/issues)) |
+| **Full model with embedded drafter** | `deepseek-ai/DeepSeek-V4-Pro-DSpark` (893 GB, MLA+MoE) | ❌ different architecture & packaging — out of scope for consumer Macs |
+| **DFlash+Markov community hybrids** | `Hikari07jp/DSpark-Gemma-4-31B-draft` | ❌ hybrid head — not yet |
+
+Targets: any dense mlx-lm text model routes automatically; a one-time load probe verifies the
+hidden-state tap reproduces the model's own forward and fails loudly if the family needs bespoke
+support (drafter-free `--mode lookup` / `--mode auto` still work with **any** target). If you run a
+pair we haven't measured, `mlx-dspark benchmark --json` produces a device-stamped result we can fold
+into the table — please share it.
+
 ## How it works
 
 - **DSpark** — a parallel backbone (5 layers) consumes the target's hidden states (EAGLE3-style) and
@@ -194,6 +217,13 @@ they share a single weight-read per step — the regime where speculative decodi
 local agent swarm (a few agents hitting the server at once) this is a large aggregate win, and single
 requests are unaffected: a lone request — or one using penalties / logprobs / `temperature > 0` dspark —
 takes the serial path, so per-request latency never regresses.
+
+Batching is **continuous** (dspark): a request is delivered the moment it finishes — it never waits
+for the batch's slowest member — and its freed slot admits the next queued or newly-arriving request
+mid-flight (measured: a short request joining two long ones returned at 2.3 s while they ran to 8.4 s).
+With `--max-draft auto`, the cap is also calibrated **per batch width**: at B=4 the measured verify
+curve flattens past the qmm knee (the paper's cheap-verify regime), so longer draft blocks pay again
+(+5% aggregate at B=4 from the auto-picked cap on an M4 Pro).
 
 Qwen3-4B-8bit, M4 Pro, 4 concurrent requests (aggregate tokens/s vs the greedy baseline run serially):
 

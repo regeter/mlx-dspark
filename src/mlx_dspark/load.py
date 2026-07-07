@@ -158,6 +158,7 @@ def load_drafter(
     quantize: bool = True,
     bits: int = 4,
     group_size: int = 64,
+    strict: bool = True,
 ):
     """Return (drafter, config). Loads bf16 weights 1:1 by matching key names.
 
@@ -165,6 +166,10 @@ def load_drafter(
     default it is quantized to 4-bit (~1.8 GB) — this is what makes spec
     decoding a net speedup on Apple Silicon. Output correctness is unaffected
     (the target verifies every token); only acceptance length may change.
+
+    A checkpoint whose tensor names don't match the model raises (``strict=True``
+    default) — a partially-loaded drafter "works" with near-zero acceptance, which
+    is worse than an error. ``strict=False`` restores warn-and-load-anyway.
     """
     path = _resolve(repo_or_path)
     config = DSparkConfig.from_json(os.path.join(path, "config.json"))
@@ -180,11 +185,19 @@ def load_drafter(
     missing = sorted(model_keys - ckpt_keys)
     unexpected = sorted(ckpt_keys - model_keys)
     if missing or unexpected:
-        print(f"[load_drafter] WARNING key mismatch:")
+        detail = ""
         if missing:
-            print(f"  missing in checkpoint ({len(missing)}): {missing[:8]}")
+            detail += f"\n  missing in checkpoint ({len(missing)}): {missing[:8]}"
         if unexpected:
-            print(f"  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}")
+            detail += f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}"
+        if strict:
+            raise ValueError(
+                f"{repo_or_path}: drafter tensor names don't match a DeepSpec-format DSpark "
+                f"drafter — the checkpoint may be a different packaging or drafter variant."
+                f"{detail}\n  (load_drafter(..., strict=False) force-loads the intersection, "
+                f"but a partially-loaded drafter gives near-zero acceptance.)"
+            )
+        print(f"[load_drafter] WARNING key mismatch:{detail}")
 
     drafter.load_weights(list(weights.items()), strict=not (missing or unexpected))
 
@@ -216,6 +229,15 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
 
     path = _resolve(repo_or_path)
     cfg = json.loads(open(os.path.join(path, "config.json")).read())
+    if cfg.get("markov_rank"):
+        # Community hybrids exist (DFlash block-16 backbone + a DSpark Markov head,
+        # e.g. Hikari07jp/DSpark-Gemma-4-31B-draft) — our vendored z-lab DFlashDraftModel
+        # has no Markov head, so the weights can't load. Refuse with the real reason.
+        raise ValueError(
+            f"{repo_or_path}: this DFlash checkpoint carries a Markov head "
+            f"(markov_rank={cfg['markov_rank']}) — a DFlash+DSpark hybrid variant mlx-dspark "
+            f"doesn't support yet. Open an issue: https://github.com/ARahim3/mlx-dspark/issues"
+        )
     rope = cfg.get("rope_parameters") or {}
     rope_theta = cfg.get("rope_theta", rope.get("rope_theta", 1_000_000.0))
     layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
@@ -238,6 +260,17 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     weights: dict[str, mx.array] = {}
     for st in glob.glob(os.path.join(path, "*.safetensors")):
         weights.update(mx.load(st))
+    model_keys = {k for k, _ in _flatten_params(drafter)}
+    ckpt_keys = set(weights.keys())
+    if model_keys != ckpt_keys:
+        missing = sorted(model_keys - ckpt_keys)
+        unexpected = sorted(ckpt_keys - model_keys)
+        raise ValueError(
+            f"{repo_or_path}: tensor names don't match a z-lab DFlash drafter."
+            + (f"\n  missing in checkpoint ({len(missing)}): {missing[:8]}" if missing else "")
+            + (f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}"
+               if unexpected else "")
+        )
     drafter.load_weights(list(weights.items()))
 
     if quantize:
@@ -250,28 +283,66 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     return drafter, config
 
 
-def load_target(repo_or_path: str = DEFAULT_TARGET):
-    """Return (Target, tokenizer). Routes text models (Qwen3) to mlx-lm and VLM/unified
-    models (Gemma-4) to mlx-vlm, then wraps in a family-aware Target (hidden-state tap)."""
+def _route_target(cfg: dict) -> str:
+    """Decide which loader owns a target config: ``"mlx_lm"`` or ``"mlx_vlm"``.
+
+    Multimodal markers (``vision_config``/``audio_config`` — e.g. gemma4_unified) go to
+    mlx-vlm. Otherwise any model_type mlx-lm ships a module for (qwen3, llama, glm_moe_dsa,
+    deepseek_v3, …) goes to mlx-lm — mirroring mlx-lm's own model_type→module lookup incl.
+    its remap table — so new text families route correctly without a code change here.
+    Anything else falls back to mlx-vlm (the pre-existing behavior)."""
+    if "vision_config" in cfg or "audio_config" in cfg:
+        return "mlx_vlm"
+    model_type = cfg.get("model_type", "")
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
+    except ImportError:
+        pass
+    from importlib.util import find_spec
+    if model_type and find_spec(f"mlx_lm.models.{model_type}") is not None:
+        return "mlx_lm"
+    return "mlx_vlm"
+
+
+def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False,
+                kv_bits: int | None = None, kv_group_size: int = 64):
+    """Return (Target, tokenizer). Routes text models to mlx-lm and multimodal/unified
+    models (Gemma-4) to mlx-vlm (see :func:`_route_target`), then wraps in a family-aware
+    Target (hidden-state tap). ``require_tap=True`` (any drafter mode) additionally probes
+    that the manual mlx-lm tap reproduces the model's own forward — a family the generic
+    loop can't replicate fails loudly here instead of silently drafting from a wrong
+    stream. Baseline/lookup modes skip the probe (they never tap)."""
     import json
 
     path = _resolve(repo_or_path)
-    model_type = ""
+    cfg: dict = {}
     cfg_path = os.path.join(path, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
-            model_type = json.load(f).get("model_type", "")
+            cfg = json.load(f)
 
-    if "qwen3" in model_type and "moe" not in model_type:
+    if _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load
 
         model, tokenizer = lm_load(path)
     else:
         from mlx_vlm import load as vlm_load
 
-        model, processor = vlm_load(path)
+        try:
+            model, processor = vlm_load(path)
+        except Exception as e:
+            raise ValueError(
+                f"{repo_or_path}: target model_type {cfg.get('model_type')!r} is supported by "
+                f"neither this mlx-lm ({e.__class__.__name__} from mlx-vlm fallback: {e}) — "
+                f"try upgrading mlx-lm/mlx-vlm, or open an issue: "
+                f"https://github.com/ARahim3/mlx-dspark/issues"
+            ) from e
         tokenizer = getattr(processor, "tokenizer", processor)
-    return Target(model, tokenizer), tokenizer
+    target = Target(model, tokenizer, kv_bits=kv_bits, kv_group_size=kv_group_size)
+    if require_tap:
+        target.verify_tap()
+    return target, tokenizer
 
 
 def load_pair(model: str = "gemma4", *, drafter: str | None = None):
@@ -281,7 +352,7 @@ def load_pair(model: str = "gemma4", *, drafter: str | None = None):
     matched drafter auto-resolves from the registry, or pass ``drafter=``. A legacy family alias
     (``"qwen3"`` / ``"gemma4"``) is still accepted."""
     target_repo, drafter_repo = resolve(model, mode="dspark", drafter=drafter)
-    target, tok = load_target(target_repo)
+    target, tok = load_target(target_repo, require_tap=True)
     drafter_m, cfg = load_drafter(drafter_repo)
     return target, tok, drafter_m, cfg
 
@@ -290,7 +361,7 @@ def load_dflash_pair(model: str = "gemma4", *, drafter: str | None = None):
     """Convenience: load (target, tokenizer, DFlash drafter, cfg), drafter bound to the target's
     embed/lm_head and ready for ``dflash_generate``. ``model`` as in :func:`load_pair`."""
     target_repo, drafter_repo = resolve(model, mode="dflash", drafter=drafter)
-    target, tok = load_target(target_repo)
+    target, tok = load_target(target_repo, require_tap=True)
     drafter_m, cfg = load_dflash(drafter_repo)
     drafter_m.bind(target.model)
     return target, tok, drafter_m, cfg

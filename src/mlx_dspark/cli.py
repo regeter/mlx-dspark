@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 
-from .load import REGISTRY, resolve
+from .load import REGISTRY
 
 _SUBCOMMANDS = ("serve", "generate", "benchmark", "models", "doctor")
 
@@ -75,6 +74,9 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--confidence-threshold", type=float, default=0.0)
     ap.add_argument("--drafter-bits", type=int, default=4)
+    ap.add_argument("--kv-bits", type=int, default=0, choices=[0, 4, 8],
+                    help="quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV "
+                         "bandwidth bill on long contexts; mlx-lm text targets only")
     ap.add_argument("--no-lookup-drafts", action="store_true",
                     help="disable hybrid n-gram drafting inside dspark mode (on by default; "
                          "free extra speedup on copy-heavy spans, lossless either way)")
@@ -96,7 +98,8 @@ def cmd_generate(argv: list[str]) -> None:
     label = labels[args.mode]
     print(f"loading {args.mode}: target={target_repo}"
           + (f", drafter={drafter_repo}" if drafter_repo else ""))
-    target, tok = load_target(target_repo)
+    target, tok = load_target(target_repo, require_tap=args.mode in ("dspark", "dflash"),
+                              kv_bits=args.kv_bits or None)
     drafter = None
     if args.mode == "dspark":
         drafter, _ = load_drafter(drafter_repo, quantize=args.drafter_bits > 0,
@@ -212,6 +215,10 @@ def cmd_serve(argv: list[str]) -> None:
                     help="top_k for requests that don't send one (see --default-temperature)")
     ap.add_argument("--confidence-threshold", type=float, default=0.0)
     ap.add_argument("--drafter-bits", type=int, default=4)
+    ap.add_argument("--kv-bits", type=int, default=0, choices=[0, 4, 8],
+                    help="quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV "
+                         "bandwidth bill on long contexts; mlx-lm text targets only "
+                         "(disables --max-batch)")
     ap.add_argument("--max-batch", type=int, default=1,
                     help="micro-batch up to N concurrently-queued requests through one batched "
                          "target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x "
@@ -265,6 +272,8 @@ def cmd_serve(argv: list[str]) -> None:
             default_top_k=args.default_top_k,
             prefix_cache_slots=args.prefix_cache_slots,
             lookup_drafts=not args.no_lookup_drafts,
+            batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
+            kv_bits=args.kv_bits or None,
         )
     except ValueError as e:
         ap.error(str(e))
@@ -316,7 +325,8 @@ def cmd_benchmark(argv: list[str]) -> None:
 
     _, target_repo, _ = resolve_mode(args.model, mode="auto", drafter=args.drafter)
     print(f"target: {target_repo}\nloading + warming up…")
-    target, tok = load_target(target_repo)
+    target, tok = load_target(
+        target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
     greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
 
     results = {"device": dev, "mlx": mx.__version__, "target": target_repo, "runs": []}
@@ -373,7 +383,7 @@ def cmd_benchmark(argv: list[str]) -> None:
                 run(f"dflash cap={cap}", lambda p: dflash_generate(
                     target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
                     max_draft_tokens=md if md else None, cap_controller=ctrl))
-        del drafter
+        drafter = None                     # release before the next mode's drafter loads
 
     if args.json:
         with open(args.json, "w") as f:

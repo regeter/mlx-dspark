@@ -88,7 +88,47 @@ class DSparkConfig:
         with open(path) as f:
             c = json.load(f)
         mt = c.get("model_type", "")
-        family = "qwen3" if "qwen3" in mt else "gemma4"
+
+        # Reject the known-incompatible checkpoint packagings with a specific message before
+        # family detection — a vLLM-speculators drafter says model_type "qwen3" too, and would
+        # otherwise die a few lines down with an unhelpful KeyError.
+        if "speculators_config" in c or "speculators_model_type" in c:
+            raise ValueError(
+                f"{path}: this checkpoint is in the vLLM 'speculators' format "
+                f"(speculators_config present), which mlx-dspark cannot load yet — it uses a "
+                f"different config schema (aux_hidden_state_layer_ids, transformer_layer_config, "
+                f"draft_vocab_size). Use a DeepSpec-native standalone drafter "
+                f"(e.g. deepseek-ai/dspark_*_block7), or open an issue: "
+                f"https://github.com/ARahim3/mlx-dspark/issues"
+            )
+        if "block_size" not in c and any(k.startswith("dspark_") for k in c):
+            raise ValueError(
+                f"{path}: this looks like a full target model with an embedded DSpark drafter "
+                f"(dspark_* fields in the target config, e.g. DeepSeek-V4-*-DSpark), not a "
+                f"standalone drafter checkpoint. mlx-dspark loads standalone DeepSpec drafters "
+                f"(e.g. deepseek-ai/dspark_*_block7)."
+            )
+
+        if "qwen3" in mt:
+            family = "qwen3"
+        elif "gemma4" in mt:
+            family = "gemma4"
+        else:
+            raise ValueError(
+                f"{path}: unsupported drafter family (model_type={mt!r}). Supported drafter "
+                f"backbones: qwen3, gemma4 (gemma4_text). Drafter-free speculation works with "
+                f"any target via --mode lookup / --mode auto; for a new drafter family, open an "
+                f"issue: https://github.com/ARahim3/mlx-dspark/issues"
+            )
+
+        required = ("hidden_size", "vocab_size", "num_hidden_layers", "intermediate_size",
+                    "num_attention_heads", "block_size", "mask_token_id", "target_layer_ids")
+        missing = [k for k in required if k not in c]
+        if missing:
+            raise ValueError(
+                f"{path}: config is missing required DeepSpec drafter fields {missing} — this "
+                f"does not look like a DeepSpec-format DSpark drafter checkpoint."
+            )
 
         if family == "qwen3":
             rp = c.get("rope_parameters") or {}

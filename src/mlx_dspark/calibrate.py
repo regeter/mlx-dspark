@@ -100,6 +100,45 @@ def measure_dspark_drafter_curve(drafter, caps: list[int],
     return curve
 
 
+def measure_batch_verify_grid(target, tap: list[int], batch_widths: list[int],
+                              widths: list[int], ctx_len: int = CTX_LEN
+                              ) -> dict[int, dict[int, float]]:
+    """``verify_ms[B][width]`` measured through the real batched forward (BatchCache rows at
+    ``ctx_len``). The qmm knee is a function of B×width total matmul rows, so the optimal cap
+    *shrinks* as the batch widens — this grid is what lets the controller pick a per-batch-width
+    cap instead of assuming the B=1 curve. One prefill builds one row; the same KV is copied
+    into all B slots (timings are content-independent)."""
+    from .batch_engine import BatchCache, batched_forward, build_batch_mask
+
+    grid: dict[int, dict[int, float]] = {}
+    for B in sorted({int(b) for b in batch_widths if int(b) > 1}):
+        cache = target.make_cache()
+        mx.eval(target.run(mx.array([[TOKEN_ID] * ctx_len]), cache, tap)[0])
+        caches = []
+        for c in cache:
+            bc = BatchCache.empty(B, c.keys.shape[1], c.keys.shape[3],
+                                  c.values.shape[3], c.keys.dtype)
+            row_k = c.keys[..., : c.offset, :]
+            row_v = c.values[..., : c.offset, :]
+            for b in range(B):
+                bc.set_row(b, row_k, row_v, c.offset)
+            caches.append(bc)
+        row: dict[int, float] = {}
+        for m in sorted(widths):
+            ids = mx.array([[TOKEN_ID] * m] * B)
+
+            def fn():
+                mask = build_batch_mask(caches[0].offsets, m)
+                logits, _ = batched_forward(target, ids, caches, tap, mask=mask)
+                for c in caches:                 # roll back so every iteration is identical
+                    c.trim([m] * B)
+                return logits
+
+            row[m] = _bench(fn)
+        grid[B] = row
+    return grid
+
+
 def measure_dflash_drafter_cost(drafter, ctx_len: int = CTX_LEN) -> float:
     """ms per DFlash draft round (cap-independent: the drafter always denoises and reads
     logits for the full block)."""
@@ -179,7 +218,8 @@ class CapController:
 
     def __init__(self, verify_ms: dict[int, float], drafter_ms: dict[int, float] | float,
                  max_cap: int, *, init_cap: int = 2, prior_p: float = 0.65,
-                 alpha: float = 0.02, hysteresis: float = 1.03, repick_every: int = 4):
+                 alpha: float = 0.02, hysteresis: float = 1.03, repick_every: int = 4,
+                 verify_grid: dict[int, dict[int, float]] | None = None):
         self.verify_ms = {int(k): float(v) for k, v in verify_ms.items()}
         self.drafter_ms = drafter_ms
         self.max_cap = max(1, int(max_cap))
@@ -189,6 +229,8 @@ class CapController:
         self.hysteresis = hysteresis
         self.repick_every = max(1, repick_every)
         self.rounds = 0
+        self.verify_grid = ({int(B): {int(k): float(v) for k, v in row.items()}
+                             for B, row in verify_grid.items()} if verify_grid else None)
 
     # -- cost model --
     def _draft_cost(self, cap: int) -> float:
@@ -222,11 +264,34 @@ class CapController:
         if best != self.cap and self.rate(best) > self.rate(self.cap) * self.hysteresis:
             self.cap = best
 
+    # -- batched operating point --
+    def cap_for(self, batch_width: int) -> int:
+        """Best cap when B rows verify together: the (B, cap) grid's argmax under the current
+        acceptance estimate. B multiplies into the same qmm-knee arithmetic as the verify width,
+        so the optimal cap usually *shrinks* as the batch widens. Uses the nearest measured
+        B ≥ batch_width; falls back to the live single-stream cap when no grid was measured.
+        (Drafter cost uses the B=1 curve — a slight underestimate at high B, conservative since
+        verify dominates round time.)"""
+        if batch_width <= 1 or not self.verify_grid:
+            return self.cap
+        bs = sorted(self.verify_grid)
+        b_key = next((b for b in bs if b >= batch_width), bs[-1])
+        curve = self.verify_grid[b_key]
+
+        def rate_b(c: int) -> float:
+            t = self._draft_cost(c) + _interp(curve, c + 1)
+            return self.expected_committed(c) / max(t, 1e-6)
+
+        return max(range(1, self.max_cap + 1), key=rate_b)
+
     def info(self) -> dict:
-        return {"cap": self.cap, "p": round(self.p, 3), "rounds": self.rounds,
-                "knee_width": knee_width(self.verify_ms),  # qmm knee → dspark-vs-dflash signal
-                "predicted_rates": {c: round(self.rate(c) * 1e3, 1)   # tok/s at each cap
-                                    for c in range(1, self.max_cap + 1)}}
+        out = {"cap": self.cap, "p": round(self.p, 3), "rounds": self.rounds,
+               "knee_width": knee_width(self.verify_ms),  # qmm knee → dspark-vs-dflash signal
+               "predicted_rates": {c: round(self.rate(c) * 1e3, 1)   # tok/s at each cap
+                                   for c in range(1, self.max_cap + 1)}}
+        if self.verify_grid:
+            out["batch_caps"] = {b: self.cap_for(b) for b in sorted(self.verify_grid)}
+        return out
 
 
 # --------------------------------------------------------------------------- disk cache
@@ -237,11 +302,12 @@ def _cache_path(cache_dir: str | None = None) -> str:
 
 
 def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
-               ctx_len: int = CTX_LEN) -> str:
+               ctx_len: int = CTX_LEN, kv_bits: int | None = None) -> str:
     dev = mx.device_info().get("device_name", "unknown")
     tgt = os.path.basename(str(target_repo).rstrip("/"))
     drf = os.path.basename(str(drafter_repo).rstrip("/")) if drafter_repo else "-"
-    return f"v{SCHEMA}|{dev}|mlx{mx.__version__}|{mode}|{tgt}|{drf}|ctx{ctx_len}"
+    kv = f"|kv{kv_bits}" if kv_bits else ""     # quantized KV changes the verify curve
+    return f"v{SCHEMA}|{dev}|mlx{mx.__version__}|{mode}|{tgt}|{drf}|ctx{ctx_len}{kv}"
 
 
 def load_cached(key: str, cache_dir: str | None = None) -> dict | None:
@@ -270,9 +336,12 @@ def save_cached(key: str, entry: dict, cache_dir: str | None = None) -> None:
 
 
 def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
-              cache_dir: str | None = None, verbose: bool = True) -> CapController:
+              cache_dir: str | None = None, verbose: bool = True,
+              batch_widths: list[int] | None = None) -> CapController:
     """Measure (or load from the disk cache) this machine+pair's cost curves and return a
-    ready :class:`CapController`. ``mode`` is ``"dspark"`` or ``"dflash"``."""
+    ready :class:`CapController`. ``mode`` is ``"dspark"`` or ``"dflash"``. ``batch_widths``
+    (e.g. ``[2, 4]`` when serving with ``--max-batch 4``) additionally measures the batched
+    verify grid so :meth:`CapController.cap_for` can pick a per-batch-width cap."""
     cfg = drafter.config
     if mode == "dspark":
         max_cap = int(cfg.block_size)
@@ -285,7 +354,8 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     else:
         raise ValueError(f"auto cap supports dspark/dflash, not {mode!r}")
 
-    key = _cache_key(mode, target_repo, drafter_repo)
+    key = _cache_key(mode, target_repo, drafter_repo,
+                     kv_bits=getattr(target, "kv_bits", None))
     entry = load_cached(key, cache_dir)
     if entry is None:
         if verbose:
@@ -308,10 +378,24 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
                   f"{'DFlash full-block viable' if rec['dflash_full_block_viable'] else 'dspark wins'} "
                   f"(dspark-vs-dflash signal)", flush=True)
 
+    # batched verify grid, measured on demand (also backfills an older cached entry)
+    want_bs = sorted({int(b) for b in (batch_widths or []) if int(b) > 1})
+    have_bs = sorted(int(b) for b in (entry.get("verify_grid") or {}))
+    if mode == "dspark" and want_bs and any(b not in have_bs for b in want_bs):
+        if verbose:
+            print(f"calibrating batched verify grid (B={want_bs}, one-time, cached)…",
+                  flush=True)
+        grid = measure_batch_verify_grid(target, list(cfg.target_layer_ids), want_bs, widths)
+        vg = entry.setdefault("verify_grid", {})
+        for B, row in grid.items():
+            vg[str(B)] = {str(k): v for k, v in row.items()}
+        save_cached(key, entry, cache_dir)
+
     verify = {int(k): float(v) for k, v in entry["verify"].items()}
     drafter_ms = (entry["drafter"] if not isinstance(entry["drafter"], dict)
                   else {int(k): float(v) for k, v in entry["drafter"].items()})
-    ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2)
+    ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2,
+                         verify_grid=entry.get("verify_grid"))
     if verbose:
         r = ctrl.info()["predicted_rates"]
         best = max(r, key=r.get)

@@ -37,8 +37,6 @@ import os
 
 import mlx.core as mx
 
-from .model import CtxCache
-
 
 def _lcp(a: list[int], b: list[int]) -> int:
     n = min(len(a), len(b))
@@ -60,14 +58,15 @@ def _trim_target(cache, to_len: int) -> None:
 
 def target_cache_reusable(cache) -> bool:
     """True if every layer cache can, at least while in its linear regime, be rolled back to
-    any earlier position: plain ``KVCache`` always; ``RotatingKVCache`` (sliding-window) only
-    counts if it exposes the mlx-lm rotation machinery (``max_size``/``is_trimmable``) — its
-    wrap is then caught per-entry at store time. Anything else (quantized, exotic) is rejected."""
+    any earlier position: plain ``KVCache`` and ``QuantizedKVCache`` always (both trim by pure
+    offset arithmetic); ``RotatingKVCache`` (sliding-window) only counts if it exposes the
+    mlx-lm rotation machinery (``max_size``/``is_trimmable``) — its wrap is then caught
+    per-entry at store time. Anything else (exotic) is rejected."""
     def ok(c) -> bool:
         name = type(c).__name__
         if not (hasattr(c, "trim") and hasattr(c, "offset")):
             return False
-        if name == "KVCache":
+        if name in ("KVCache", "QuantizedKVCache"):
             return True
         if name == "RotatingKVCache":
             return hasattr(c, "max_size") and hasattr(c, "is_trimmable")

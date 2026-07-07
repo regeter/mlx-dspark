@@ -71,7 +71,7 @@ def test_streamer_uses_streaming_detokenizer_for_fast_tokenizers():
     # a real byte-level-BPE fast tokenizer (the qwen-style case) must select mlx-lm's
     # BPE streaming detokenizer — not the O(n²) full-decode fallback — and produce
     # byte-identical text to tokenizer.decode
-    tokenizers = __import__("pytest").importorskip("tokenizers")
+    __import__("pytest").importorskip("tokenizers")
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
 

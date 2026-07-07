@@ -134,6 +134,48 @@ def test_batchable_rejects_rotating_cache():
     assert not batchable(T())
 
 
+# --- slot reuse (M4 dynamic admission) ---
+
+def test_empty_then_set_row_admits():
+    c = BatchCache.empty(3, n_heads=2, dk=4, dv=4, dtype=mx.float32)
+    assert c.offsets == [0, 0, 0]
+    k = mx.random.normal((1, 2, 5, 4))
+    v = mx.random.normal((1, 2, 5, 4))
+    c.set_row(1, k, v, 5)
+    assert c.offsets == [0, 5, 0]
+    assert mx.allclose(c.keys[1:2, :, :5, :], k).item()
+
+
+def test_set_row_grows_buffer():
+    from mlx_dspark.batch_engine import STEP
+
+    c = BatchCache.empty(2, n_heads=2, dk=4, dv=4, dtype=mx.float32)
+    n = STEP + 7
+    k = mx.random.normal((1, 2, n, 4))
+    c.set_row(0, k, k, n)
+    assert c.keys.shape[2] >= n and c.offsets == [n, 0]
+    assert mx.allclose(c.keys[0:1, :, :n, :], k).item()
+
+
+def test_move_row_compacts_and_vacates():
+    pairs = _rows([3, 2, 4])
+    c = BatchCache.from_rows(pairs)
+    c.move_row(2, 0)                       # retire row 0, compact last row into its slot
+    assert c.offsets == [4, 2, 0]
+    assert mx.allclose(c.keys[0:1, :, :4, :], pairs[2][0]).item()
+    assert mx.allclose(c.values[0:1, :, :4, :], pairs[2][1]).item()
+
+
+def test_rows_view_narrows_offset_and_update():
+    c = BatchCache.from_rows(_rows([3, 1, 4]))
+    c.rows = 2                             # active prefix = rows 0..1
+    assert c.offset.tolist() == [3, 1]
+    k = mx.random.normal((2, 2, 1, 4))     # update covers only the active width
+    K, V = c.update_and_fetch(k, k)
+    assert c.offsets == [4, 2, 4]          # row 2 untouched
+    assert K.shape[0] == 2 and K.shape[2] == 4   # Lcur over the active rows only
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
 

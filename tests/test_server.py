@@ -288,3 +288,30 @@ def test_penalties_passthrough(server):
            "presence_penalty": 1.5, "frequency_penalty": 0.7})
     assert eng.calls[-1]["presence_penalty"] == 1.5
     assert eng.calls[-1]["frequency_penalty"] == 0.7
+
+
+def test_n_greedy_replicates_one_generation(server):
+    eng, base = server
+    r = _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}], "n": 3})
+    assert [c["index"] for c in r["choices"]] == [0, 1, 2]
+    assert len({c["message"]["content"] for c in r["choices"]}) == 1
+    assert len(eng.calls) == 1                      # greedy: one generation serves all n
+    assert r["usage"]["completion_tokens"] == 5     # counts actual generated tokens
+
+
+def test_n_sampled_generates_n(server):
+    eng, base = server
+    r = _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}], "n": 3, "temperature": 0.8})
+    assert len(r["choices"]) == 3
+    assert len(eng.calls) == 3                      # independent samples
+    assert r["usage"]["completion_tokens"] == 15
+
+
+def test_n_with_stream_is_rejected(server):
+    _, base = server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}], "n": 2, "stream": True})
+    assert e.value.code == 400

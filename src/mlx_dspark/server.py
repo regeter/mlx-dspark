@@ -21,6 +21,7 @@ Endpoints: ``POST /v1/chat/completions`` (stream + non-stream), ``POST /v1/compl
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue as _queue
@@ -180,6 +181,8 @@ class Engine:
         default_top_k: int | None = None,
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
+        batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
+        kv_bits: int | None = None,              # quantize the target KV cache (4/8)
     ) -> "Engine":
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -194,7 +197,8 @@ class Engine:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-gen")
 
         def _load_models():
-            tgt, tok = load_target(target_repo)
+            tgt, tok = load_target(target_repo, require_tap=mode in ("dspark", "dflash"),
+                                   kv_bits=kv_bits)
             draft = None
             if mode == "dspark":
                 draft, _ = load_drafter(drafter_repo, quantize=drafter_bits > 0,
@@ -210,7 +214,7 @@ class Engine:
                 from .calibrate import calibrate
 
                 ctrl = calibrate(tgt, draft, mode=mode, target_repo=target_repo,
-                                 drafter_repo=drafter_repo)
+                                 drafter_repo=drafter_repo, batch_widths=batch_widths)
             return tgt, tok, draft, ctrl
 
         tgt, tok, draft, cap_controller = executor.submit(_load_models).result()
@@ -358,6 +362,9 @@ class Engine:
 # --------------------------------------------------------------------------- batching engine
 
 
+_STOP = object()   # sentinel: unwedges the scheduler thread so the process can exit
+
+
 class _Job:
     """One queued generation request awaiting a (possibly batched) run."""
     __slots__ = ("prompt_ids", "params", "on_text", "result", "error", "done")
@@ -372,13 +379,15 @@ class _Job:
 
 
 class BatchEngine:
-    """Micro-batching wrapper around an :class:`Engine`: concurrently-queued requests that share
-    sampling params run as ONE static batch through the batched target forward (a single
-    weight-read for all rows) — ~1.5–2.5× aggregate throughput under 2–4 concurrent requests
-    (the local-agent-swarm case). Dense mlx-lm targets + dspark/baseline only; anything else, a
-    lone request, or a temp>0 dspark request runs the serialized Engine path unchanged, so B=1
-    latency never regresses. Prefix caching and the auto-cap controller apply to the serial path
-    only (batched rows use the fixed cap and skip prefix reuse — documented).
+    """Batching wrapper around an :class:`Engine`. Concurrently-queued greedy **dspark**
+    requests run as a **continuous** :class:`~mlx_dspark.batch_engine.SpecSlots` session
+    (dynamic admission): each request's result is delivered the moment its row finishes, and
+    the freed slot admits the next queued/arriving request mid-flight — a short request never
+    waits for a long one. Baseline mode uses the static batched kernel. Dense mlx-lm targets
+    only; anything else, a lone request, or a temp>0 dspark request runs the serialized Engine
+    path unchanged, so B=1 latency never regresses. Prefix caching and the auto-cap controller
+    apply to the serial path only (batched rows use the fixed cap and skip prefix reuse —
+    documented).
 
     All MLX work stays on the Engine's single generation thread: a scheduler loop runs *on* that
     executor and pulls jobs off a queue; HTTP handler threads only enqueue and block for their
@@ -392,7 +401,16 @@ class BatchEngine:
         self._q: _queue.Queue = _queue.Queue()
         self.batch_stats = {"batched_requests": 0, "batches": 0, "max_batch_seen": 0,
                             "serial_requests": 0}
-        engine._executor.submit(self._scheduler)   # occupies the one MLX thread forever
+        engine._executor.submit(self._scheduler)   # occupies the one MLX thread until close()
+        # concurrent.futures' shutdown hook joins the executor thread at interpreter exit —
+        # a forever-looping scheduler would wedge the process (Ctrl-C'd server, scripts,
+        # tests). Regular atexit handlers run BEFORE that join, so this unblocks it.
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        """Stop the scheduler thread (idempotent). Queued jobs already picked up finish
+        normally; the sentinel is consumed at the next idle point."""
+        self._q.put(_STOP)
 
     def __getattr__(self, name):                    # delegate model_id/mode/spec_info/created/…
         return getattr(self.engine, name)
@@ -419,8 +437,11 @@ class BatchEngine:
     # --- scheduler (runs on the MLX thread) ---
     def _scheduler(self):
         while True:
+            batch = []
             try:
                 job = self._q.get()
+                if job is _STOP:
+                    return
                 batch = [job]
                 end = time.time() + self.window_s
                 while len(batch) < self.max_batch:
@@ -428,9 +449,13 @@ class BatchEngine:
                     if rem <= 0:
                         break
                     try:
-                        batch.append(self._q.get(timeout=rem))
+                        nxt = self._q.get(timeout=rem)
                     except _queue.Empty:
                         break
+                    if nxt is _STOP:
+                        self._q.put(nxt)     # finish this batch, exit on the next get()
+                        break
+                    batch.append(nxt)
                 self._run(batch)
             except Exception:  # noqa: BLE001 — a scheduler that dies wedges the server
                 for j in batch:
@@ -454,8 +479,88 @@ class BatchEngine:
             if len(jobs) == 1 or (self.engine.mode == "dspark" and temp > 0):
                 for j in jobs:                       # size-1, or temp>0 dspark (no batched sampler)
                     self._run_serial(j)
+            elif self.engine.mode == "dspark":
+                self._run_session(jobs)              # continuous: admit/retire mid-flight (M4)
             else:
                 self._run_batched(jobs, key)
+
+    # --- continuous batching (dspark greedy): slot session with dynamic admission ---
+    @staticmethod
+    def _batchable_greedy(job: _Job) -> bool:
+        p = job.params
+        return (not p["presence_penalty"] and not p["frequency_penalty"]
+                and p["logprobs"] is None and not p["temperature"])
+
+    def _admit(self, slots, job: _Job) -> bool:
+        try:
+            p = job.params
+            slots.admit(job.prompt_ids, max_new_tokens=p["max_tokens"],
+                        on_text=job.on_text, stop=p["stop"], meta=job)
+            return True
+        except BaseException as e:  # noqa: BLE001 — a bad request must not kill the session
+            job.error = e
+            job.done.set()
+            return False
+
+    def _run_session(self, jobs: list[_Job]):
+        """Continuous batching (M4): run greedy dspark jobs through a :class:`SpecSlots`
+        session. A finished request is delivered the instant its row retires (it does not wait
+        for the batch's slowest row), and its freed slot admits the next queued/arriving
+        batchable job mid-flight. Retirement compacts rows, so a lone long tail runs at serial
+        verify width. A non-batchable arrival (penalties/logprobs/temp>0) is deferred to the end
+        of the session and also stops further admissions, so it can't starve."""
+        from .batch_engine import SpecSlots
+
+        eng = self.engine
+        slots = SpecSlots(eng.target, eng.tokenizer, eng.drafter, capacity=self.max_batch,
+                          max_draft_tokens=eng.max_draft_tokens or 2,
+                          cap_controller=eng.cap_controller)
+        waiting = list(jobs)     # accepted into this session, not yet admitted
+        deferred: list[_Job] = []
+        admitted = 0
+        peak = 0
+        t0 = time.time()
+        try:
+            while slots.n_active or waiting:
+                while waiting and slots.has_free_slot:
+                    admitted += self._admit(slots, waiting.pop(0))
+                if not deferred:                 # pull mid-flight arrivals into free capacity
+                    while len(waiting) < self.max_batch:
+                        try:
+                            nj = self._q.get_nowait()
+                        except _queue.Empty:
+                            break
+                        if nj is _STOP:
+                            self._q.put(nj)      # session drains; scheduler exits after it
+                            break
+                        if self._batchable_greedy(nj):
+                            waiting.append(nj)
+                        else:
+                            deferred.append(nj)  # fairness: stop admitting, drain, then serve
+                            break
+                    while waiting and slots.has_free_slot:
+                        admitted += self._admit(slots, waiting.pop(0))
+                peak = max(peak, slots.n_active)
+                for job, res in slots.step():
+                    job.result = res
+                    job.done.set()
+                    s = eng.stats
+                    s["requests"] += 1
+                    s["prompt_tokens"] += len(job.prompt_ids)
+                    s["completion_tokens"] += res.num_tokens
+                    s["sum_accept_len"] += res.mean_accept_len * res.num_tokens
+        except BaseException as e:  # noqa: BLE001
+            outstanding = waiting + [slots.meta[b] for b in range(slots.n_active)]
+            for j in outstanding:
+                if j is not None and not j.done.is_set():
+                    j.error = e
+                    j.done.set()
+        eng.stats["generation_seconds"] += time.time() - t0
+        self.batch_stats["batched_requests"] += admitted
+        self.batch_stats["batches"] += 1
+        self.batch_stats["max_batch_seen"] = max(self.batch_stats["max_batch_seen"], peak)
+        for j in deferred:
+            self._run_serial(j)
 
     def _run_serial(self, job: _Job):
         try:
@@ -471,7 +576,8 @@ class BatchEngine:
             job.done.set()
 
     def _run_batched(self, jobs: list[_Job], key):
-        from .batch_engine import batch_generate_baseline, batch_spec_generate
+        # baseline only — dspark groups go through the continuous _run_session path
+        from .batch_engine import batch_generate_baseline
 
         temp, top_p, top_k = key
         prompts = [j.prompt_ids for j in jobs]
@@ -479,15 +585,9 @@ class BatchEngine:
         on_texts = [j.on_text for j in jobs]
         stops = [j.params["stop"] for j in jobs]
         try:
-            if self.engine.mode == "dspark":
-                res = batch_spec_generate(
-                    self.engine.target, self.engine.tokenizer, self.engine.drafter, prompts,
-                    max_new_tokens=max_toks, max_draft_tokens=self.engine.max_draft_tokens or 2,
-                    on_texts=on_texts, stops=stops)
-            else:  # baseline
-                res = batch_generate_baseline(
-                    self.engine.target, self.engine.tokenizer, prompts, max_new_tokens=max_toks,
-                    temperature=temp, top_p=top_p, top_k=top_k, on_texts=on_texts, stops=stops)
+            res = batch_generate_baseline(
+                self.engine.target, self.engine.tokenizer, prompts, max_new_tokens=max_toks,
+                temperature=temp, top_p=top_p, top_k=top_k, on_texts=on_texts, stops=stops)
         except BaseException as e:  # noqa: BLE001
             for j in jobs:
                 j.error = e
@@ -739,42 +839,58 @@ def make_handler(engine: Engine, api_key: str | None):
                 params["logprobs"] = int(_lp) if _lp is not None else None
             model = req.get("model") or engine.model_id
             stream = bool(req.get("stream", False))
+            n = max(1, min(int(req.get("n") or 1), 8))
             want_tools = bool(chat and req.get("tools"))
             cid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
             created = int(time.time())
 
             if stream:
+                if n > 1:
+                    return self._send_error(400, "'n' > 1 is not supported with stream=true")
                 return self._run_stream(prompt_ids, params, model, cid, created, chat,
                                         req, want_tools)
 
-            res = engine.generate(prompt_ids, on_text=None, **params)
+            if n == 1 or params["temperature"] == 0:
+                # greedy is deterministic: n identical choices from one generation
+                res_list = [engine.generate(prompt_ids, on_text=None, **params)] * n
+                gen_tokens = res_list[0].num_tokens
+            else:
+                # sampled n-best: submit concurrently so a BatchEngine batches the rows
+                # (one shared weight-read per step); a plain Engine serializes them safely
+                from concurrent.futures import ThreadPoolExecutor as _Pool
+
+                with _Pool(max_workers=n) as pool:
+                    res_list = list(pool.map(
+                        lambda _i: engine.generate(prompt_ids, on_text=None, **params),
+                        range(n)))
+                gen_tokens = sum(r.num_tokens for r in res_list)
             usage = {
                 "prompt_tokens": len(prompt_ids),
-                "completion_tokens": res.num_tokens,
-                "total_tokens": len(prompt_ids) + res.num_tokens,
+                "completion_tokens": gen_tokens,
+                "total_tokens": len(prompt_ids) + gen_tokens,
             }
-            if chat:
-                content, finish, tool_calls = res.text, res.finish_reason, None
-                if want_tools:
-                    parsed, cleaned = parse_tool_calls(res.text)
-                    if parsed:
-                        tool_calls, content, finish = parsed, (cleaned or None), "tool_calls"
-                message = {"role": "assistant", "content": content}
-                if tool_calls:
-                    message["tool_calls"] = tool_calls
-                choice = {"index": 0, "message": message, "finish_reason": finish}
-                if res.logprobs is not None:
-                    choice["logprobs"] = _logprobs_content(res, engine.tokenizer)
-                obj = {"id": cid, "object": "chat.completion", "created": created,
-                       "model": model, "choices": [choice], "usage": usage,
-                       "x_mlx_dspark": engine.spec_info(res)}
-            else:
-                choice = {"index": 0, "text": res.text, "finish_reason": res.finish_reason}
-                if res.logprobs is not None:
-                    choice["logprobs"] = _logprobs_completions(res, engine.tokenizer)
-                obj = {"id": cid, "object": "text_completion", "created": created,
-                       "model": model, "choices": [choice], "usage": usage,
-                       "x_mlx_dspark": engine.spec_info(res)}
+            choices = []
+            for i, res in enumerate(res_list):
+                if chat:
+                    content, finish, tool_calls = res.text, res.finish_reason, None
+                    if want_tools:
+                        parsed, cleaned = parse_tool_calls(res.text)
+                        if parsed:
+                            tool_calls, content, finish = parsed, (cleaned or None), "tool_calls"
+                    message = {"role": "assistant", "content": content}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    choice = {"index": i, "message": message, "finish_reason": finish}
+                    if res.logprobs is not None:
+                        choice["logprobs"] = _logprobs_content(res, engine.tokenizer)
+                else:
+                    choice = {"index": i, "text": res.text, "finish_reason": res.finish_reason}
+                    if res.logprobs is not None:
+                        choice["logprobs"] = _logprobs_completions(res, engine.tokenizer)
+                choices.append(choice)
+            obj = {"id": cid, "object": "chat.completion" if chat else "text_completion",
+                   "created": created, "model": model, "choices": choices, "usage": usage,
+                   "x_mlx_dspark": engine.spec_info(res_list[0])}
             self._send_json(200, obj)
 
         def _run_stream(self, prompt_ids, params, model, cid, created, chat, req, want_tools):

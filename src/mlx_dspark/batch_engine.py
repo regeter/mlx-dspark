@@ -73,6 +73,7 @@ class BatchCache:
         self.keys = keys
         self.values = values
         self.offsets = list(offsets)  # python list: cheap per-row indexing for writes/trim/mask
+        self.rows: int | None = None  # active-prefix view width (None = all rows); see SpecSlots
 
     # -- construction --
     @classmethod
@@ -94,17 +95,47 @@ class BatchCache:
             values[b : b + 1, :, :n, :] = v
         return cls(keys, values, lens)
 
+    @classmethod
+    def empty(cls, capacity: int, n_heads: int, dk: int, dv: int, dtype) -> "BatchCache":
+        """A fixed-capacity cache with every row empty — the slot-reuse form (SpecSlots):
+        rows are filled by :meth:`set_row` on admission and vacated by trimming to 0."""
+        return cls(mx.zeros((capacity, n_heads, STEP, dk), dtype=dtype),
+                   mx.zeros((capacity, n_heads, STEP, dv), dtype=dtype), [0] * capacity)
+
+    # -- slot reuse (dynamic admission) --
+    def set_row(self, b: int, keys: mx.array, values: mx.array, offset: int) -> None:
+        """Overwrite row b's KV with a single-seq row (``[1, H, offset, D]``) and reset its
+        offset — how a freed slot admits a new request without resizing the batch dim."""
+        if offset > self.keys.shape[2]:
+            self._grow(_round_step(offset))
+        if offset:
+            self.keys[b : b + 1, :, :offset, :] = keys
+            self.values[b : b + 1, :, :offset, :] = values
+        self.offsets[b] = offset
+
+    def move_row(self, src: int, dst: int) -> None:
+        """Copy row src's live columns onto row dst and vacate src — retirement compaction,
+        keeping active rows a contiguous prefix so forwards can run at the active width."""
+        n = self.offsets[src]
+        if n:
+            self.keys[dst : dst + 1, :, :n, :] = self.keys[src : src + 1, :, :n, :]
+            self.values[dst : dst + 1, :, :n, :] = self.values[src : src + 1, :, :n, :]
+        self.offsets[dst] = n
+        self.offsets[src] = 0
+
     # -- interface the attention layers use --
     @property
     def offset(self) -> mx.array:
-        return mx.array(self.offsets, dtype=mx.int32)
+        off = self.offsets if self.rows is None else self.offsets[: self.rows]
+        return mx.array(off, dtype=mx.int32)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Write each row's ``T`` new tokens at its own offset, advance offsets, and return the
         full ``[B, H, Lcur, D]`` key/value tensors (``Lcur = max(new offsets)``). Rows shorter
-        than ``Lcur`` carry stale/other-row content past their offset — the mask hides it."""
+        than ``Lcur`` carry stale/other-row content past their offset — the mask hides it.
+        ``keys`` may cover only the first B rows of the buffer (the active-prefix view)."""
         B, H, T, _ = keys.shape
-        need = max(o + T for o in self.offsets)
+        need = max(o + T for o in self.offsets[:B])
         if need > self.keys.shape[2]:
             self._grow(_round_step(need))
         for b in range(B):
@@ -112,8 +143,8 @@ class BatchCache:
             self.keys[b : b + 1, :, o : o + T, :] = keys[b : b + 1]
             self.values[b : b + 1, :, o : o + T, :] = values[b : b + 1]
             self.offsets[b] = o + T
-        Lcur = max(self.offsets)
-        return self.keys[:, :, :Lcur, :], self.values[:, :, :Lcur, :]
+        Lcur = max(self.offsets[:B])
+        return self.keys[:B, :, :Lcur, :], self.values[:B, :, :Lcur, :]
 
     def _grow(self, new_lbuf: int) -> None:
         B, H, _, Dk = self.keys.shape
@@ -397,6 +428,176 @@ def _batched_sample_block(drafter, base_logits: mx.array, first_prev: list[int])
     return mx.stack(toks, axis=1)                               # [B, cap]
 
 
+class SpecSlots:
+    """Fixed-capacity slot-based continuous batched **DSpark** spec decoding (greedy) — the
+    dynamic-admission engine (M4). ``capacity`` slots share fixed batched KV buffers; a request
+    is :meth:`admit`-ted into a free slot (single-seq prefill → :meth:`BatchCache.set_row`),
+    :meth:`step` runs one spec round over all active rows, and a finished row is *retired the
+    moment it finishes* — its result returned immediately, its slot free for the next request.
+    The batch dimension is never resized; instead retirement **compacts** the active rows into a
+    contiguous prefix (:meth:`BatchCache.move_row`, a one-off row copy ≈ a bandwidth blip) and
+    every forward runs at the *active* width — so a lone tail request verifies at serial width
+    (no pad waste, and B_act=1 is the bit-exact single-stream numeric path).
+
+    Per-row output is the target's greedy decoding under the usual batched-quantized contract
+    (greedy-correct per row; bit-identical to single-seq only at width 1 — see NOTES). Drafting
+    is Stage B (one batched backbone forward) or Stage A (per-row) via ``batched_drafter``."""
+
+    def __init__(self, target, tokenizer, drafter, *, capacity: int,
+                 max_draft_tokens: int = 2, batched_drafter: bool = True,
+                 cap_controller=None):
+        cfg = drafter.config
+        self.target, self.tokenizer, self.drafter = target, tokenizer, drafter
+        self.tap = list(cfg.target_layer_ids)
+        self.k = int(cfg.block_size)
+        self.mask_id = int(cfg.mask_token_id)
+        self.cap = max(1, min(int(max_draft_tokens), self.k))
+        self.ctrl = cap_controller     # optional CapController: per-batch-width cap + EWMA
+        self.batched_drafter = batched_drafter
+        self.capacity = int(capacity)
+        self.n_active = 0
+        self.caches: list[BatchCache] | None = None   # built from the first admission's shapes
+        C = self.capacity
+        self.ctx = [None] * C          # per-slot drafter CtxCache list
+        self.n_cached = [0] * C        # per-slot target tokens cached (drafter ctx offset)
+        self.pending = [0] * C         # per-slot next token to verify
+        self.trk = [None] * C          # per-slot single-row _RowTracker
+        self.meta = [None] * C         # caller's job handle, returned on retirement
+        self.t0 = [0.0] * C
+
+    @property
+    def has_free_slot(self) -> bool:
+        return self.n_active < self.capacity
+
+    def admit(self, prompt_ids: list[int], *, max_new_tokens: int,
+              on_text=None, stop=None, meta=None) -> None:
+        """Prefill one request (single-seq, seeding its drafter ctx) into the next free slot."""
+        if not self.has_free_slot:
+            raise RuntimeError("SpecSlots.admit: no free slot")
+        from .generate import _prefill_tapped
+
+        cache = self.target.make_cache()
+        ctx = self.drafter.make_ctx_cache()
+        logits, _ = _prefill_tapped(self.target, list(prompt_ids), cache, self.tap,
+                                    drafter=self.drafter, ctx_caches=ctx)
+        first = int(mx.argmax(logits[0, -1]).item())
+        if self.caches is None:
+            self.caches = [BatchCache.empty(self.capacity, c.keys.shape[1], c.keys.shape[3],
+                                            c.values.shape[3], c.keys.dtype) for c in cache]
+        b = self.n_active
+        for bc, c in zip(self.caches, cache):
+            bc.set_row(b, c.keys[..., : c.offset, :], c.values[..., : c.offset, :], c.offset)
+        self.ctx[b] = ctx
+        self.n_cached[b] = len(prompt_ids)
+        self.pending[b] = first
+        self.trk[b] = _RowTracker(self.tokenizer, [first], max_new_tokens=[max_new_tokens],
+                                  on_texts=[on_text], stops=[stop])
+        self.meta[b] = meta
+        self.t0[b] = time.time()
+        self.n_active += 1
+
+    def _retire(self, b: int):
+        """Deliver slot b's result and compact the last active row into its place."""
+        meta, res = self.meta[b], self.trk[b].results(time.time() - self.t0[b])[0]
+        last = self.n_active - 1
+        if b != last:
+            for c in self.caches:
+                c.move_row(last, b)
+            for state in (self.ctx, self.n_cached, self.pending, self.trk, self.meta, self.t0):
+                state[b] = state[last]
+        for c in self.caches:
+            c.offsets[last] = 0
+        self.ctx[last], self.trk[last], self.meta[last] = None, None, None
+        self.pending[last], self.n_cached[last], self.t0[last] = 0, 0, 0.0
+        self.n_active = last
+        return meta, res
+
+    def _sweep_finished(self) -> list:
+        out = []
+        b = 0
+        while b < self.n_active:
+            if self.trk[b].finished[0]:
+                out.append(self._retire(b))   # compaction refills slot b — recheck the same b
+            else:
+                b += 1
+        return out
+
+    def step(self) -> list:
+        """One spec round over the active rows. Returns ``[(meta, GenResult), …]`` for every
+        request that finished this round (already retired; their slots are free again)."""
+        finished = self._sweep_finished()      # e.g. eos / token limit hit on the prefill token
+        B = self.n_active
+        if B == 0:
+            return finished
+        drafter, target = self.drafter, self.target
+        k, mask_id = self.k, self.mask_id
+        # cap for this round: calibrated per batch width when a controller is attached
+        # (B multiplies into the qmm-knee arithmetic, so wider batches want shorter caps);
+        # per-round cap changes are lossless — the cap only picks how many drafts get verified
+        cap = self.cap if self.ctrl is None else max(
+            1, min(self.ctrl.cap_for(B) if B > 1 else self.ctrl.cap, self.k))
+        pend = self.pending[:B]
+        for c in self.caches:
+            c.rows = B                          # attention reads the active-width rope offsets
+
+        # ---- 1. draft ----
+        if self.batched_drafter:
+            # Stage B: one batched backbone forward over [B, k, H]. The ragged part is the
+            # per-row context — pad it to a rectangle + a mask that hides each row's padding,
+            # and feed a per-row RoPE offset (rows sit at different context lengths).
+            block_ids = mx.array([[pend[b]] + [mask_id] * (k - 1) for b in range(B)])   # [B,k]
+            noise = drafter.embed(block_ids)                                    # [B, k, H]
+            bctx, ctx_lens = _batched_ctx([self.ctx[b] for b in range(B)])
+            mask = _ctx_block_mask(ctx_lens, k)
+            block_hidden = drafter.backbone(noise, mx.array(ctx_lens), bctx, mask)  # [B, k, H]
+            base_logits = drafter.compute_logits(block_hidden[:, :cap, :])      # [B, cap, V]
+            drafts_arr = _batched_sample_block(drafter, base_logits, pend)      # [B, cap]
+            drafts = [drafts_arr[b] for b in range(B)]
+        else:
+            # Stage A: run the drafter sequentially per row (batched verify only).
+            drafts = []
+            for b in range(B):
+                block_ids = [pend[b]] + [mask_id] * (k - 1)
+                noise = drafter.embed(mx.array([block_ids]))
+                block_hidden = drafter.backbone(noise, self.n_cached[b], self.ctx[b])
+                base_logits = drafter.compute_logits(block_hidden[:, :cap, :])[0]   # [cap, V]
+                drafts.append(drafter.sample_block(base_logits, first_prev_token=pend[b]))
+
+        # ---- 2. batched verify (the shared weight-read), at the active width ----
+        verify_ids = mx.stack([mx.concatenate([mx.array([pend[b]], dtype=drafts[b].dtype),
+                                               drafts[b]]) for b in range(B)])      # [B, cap+1]
+        vmask = build_batch_mask(self.caches[0].offsets[:B], cap + 1)
+        v_logits, v_fused = batched_forward(target, verify_ids, self.caches, self.tap,
+                                            mask=vmask)
+
+        # ---- 3. accept per row (row-wise cumprod of the argmax match) ----
+        tt = mx.argmax(v_logits, axis=-1)                                           # [B, cap+1]
+        match = (mx.stack(drafts) == tt[:, :cap]).astype(mx.int32)
+        n_arr = mx.cumprod(match, axis=1).sum(axis=1)                               # [B]
+        mx.eval(tt, n_arr, v_fused)
+        n_list = n_arr.tolist()
+        tt_list = tt.tolist()
+
+        # ---- 4. commit + per-row trim + per-row drafter-ctx update ----
+        trims = []
+        for b in range(B):
+            n = int(n_list[b])
+            committed = [int(x) for x in drafts[b].tolist()[:n]] + [int(tt_list[b][n])]
+            trims.append(cap - n)
+            drafter.update_context(v_fused[b : b + 1, : n + 1, :],
+                                   ctx_offset=self.n_cached[b], ctx_caches=self.ctx[b])
+            self.n_cached[b] += n + 1
+            self.trk[b].commit(0, committed, accept_len=len(committed))
+            self.pending[b] = self.trk[b].out_ids[0][-1]
+            if self.ctrl is not None:          # same drafter acceptance process as serial rounds
+                self.ctrl.update(n, cap)
+        for c in self.caches:                              # per-row rollback, every layer
+            c.trim(trims)
+
+        finished += self._sweep_finished()
+        return finished
+
+
 def batch_spec_generate(
     target,
     tokenizer,
@@ -410,91 +611,26 @@ def batch_spec_generate(
     stops=None,                             # per-row stop-string lists
     seed: int | None = None,
 ) -> list[GenResult]:
-    """Static batched **DSpark** speculative decode (greedy) — Stage A: the target *verify*
-    is batched (all rows share one weight-read), the drafter runs sequentially per row.
-
-    Every row drafts a fixed ``cap = max_draft_tokens`` tokens, so the verify block is a uniform
-    ``[B, cap+1]``; rows accept different prefixes and each rolls its own KV back by ``cap - n``
-    via the per-row :meth:`BatchCache.trim`. Output per row is the target's greedy decoding — B=1
-    is bit-exact vs single-seq; at B>1 it's greedy-correct up to the target's batch-dependent
-    quantized-matmul rounding (see NOTES). Returns one GenResult per row."""
+    """Static batched **DSpark** speculative decode (greedy): admit all B prompts into a
+    :class:`SpecSlots` of capacity B and step until done. Rows that finish early retire
+    immediately (their timing reflects their own finish; the remaining rows verify at the
+    narrower active width). Per row the output is the target's greedy decoding — B=1 is
+    bit-exact vs single-seq; at B>1 greedy-correct up to the target's batch-dependent
+    quantized-matmul rounding (see NOTES). Returns one GenResult per row, in prompt order."""
     if seed is not None:
         mx.random.seed(seed)
-    cfg = drafter.config
-    tap = list(cfg.target_layer_ids)
-    k = int(cfg.block_size)
-    mask_id = int(cfg.mask_token_id)
-    cap = max(1, min(int(max_draft_tokens), k))
     B = len(prompts_ids)
-    t0 = time.time()
-
-    # --- per-row prefill (seeds each row's drafter ctx) + merge target caches into a batch ---
-    from .generate import _prefill_tapped
-
-    row_caches, ctx_caches, n_cached, pending = [], [], [], []
-    for ids in prompts_ids:
-        cache = target.make_cache()
-        ctx = drafter.make_ctx_cache()
-        logits, _ = _prefill_tapped(target, ids, cache, tap, drafter=drafter, ctx_caches=ctx)
-        row_caches.append(cache)
-        ctx_caches.append(ctx)
-        n_cached.append(len(ids))
-        pending.append(int(mx.argmax(logits[0, -1]).item()))
-    caches = _merge_row_caches(row_caches)
-    trk = _RowTracker(tokenizer, pending, max_new_tokens=max_new_tokens,
-                      on_texts=on_texts, stops=stops)
-
-    while not trk.all_done():
-        # ---- 1. draft ----
-        if batched_drafter:
-            # Stage B: one batched backbone forward over [B, k, H]. The ragged part is the
-            # per-row context — pad it to a rectangle + a mask that hides each row's padding, and
-            # feed a per-row RoPE offset (rows sit at different context lengths). Reuses
-            # drafter.backbone unchanged (attend now takes the mask).
-            block_ids = mx.array([[pending[b]] + [mask_id] * (k - 1) for b in range(B)])  # [B,k]
-            noise = drafter.embed(block_ids)                                    # [B, k, H]
-            bctx, ctx_lens = _batched_ctx(ctx_caches)
-            mask = _ctx_block_mask(ctx_lens, k)
-            block_hidden = drafter.backbone(noise, mx.array(ctx_lens), bctx, mask)   # [B, k, H]
-            base_logits = drafter.compute_logits(block_hidden[:, :cap, :])       # [B, cap, V]
-            drafts_arr = _batched_sample_block(drafter, base_logits, pending)    # [B, cap]
-            drafts = [drafts_arr[b] for b in range(B)]
-        else:
-            # Stage A: run the drafter sequentially per row (batched verify only).
-            drafts = []
-            for b in range(B):
-                block_ids = [pending[b]] + [mask_id] * (k - 1)
-                noise = drafter.embed(mx.array([block_ids]))
-                block_hidden = drafter.backbone(noise, n_cached[b], ctx_caches[b])
-                base_logits = drafter.compute_logits(block_hidden[:, :cap, :])[0]      # [cap, V]
-                drafts.append(drafter.sample_block(base_logits, first_prev_token=pending[b]))
-
-        # ---- 2. batched verify (the shared weight-read) ----
-        verify_ids = mx.stack([mx.concatenate([mx.array([pending[b]], dtype=drafts[b].dtype),
-                                               drafts[b]]) for b in range(B)])       # [B, cap+1]
-        v_logits, v_fused = batched_forward(target, verify_ids, caches, tap)
-
-        # ---- 3. accept per row (row-wise cumprod of the argmax match) ----
-        tt = mx.argmax(v_logits, axis=-1)                                            # [B, cap+1]
-        draft_stack = mx.stack(drafts)                                               # [B, cap]
-        match = (draft_stack == tt[:, :cap]).astype(mx.int32)
-        n_arr = mx.cumprod(match, axis=1).sum(axis=1)                                # [B]
-        mx.eval(tt, n_arr, v_fused)
-        n_list = n_arr.tolist()
-        tt_list = tt.tolist()
-
-        # ---- 4. commit + per-row trim + per-row drafter-ctx update ----
-        trims = []
-        for b in range(B):
-            n = int(n_list[b])
-            committed = [int(x) for x in drafts[b].tolist()[:n]] + [int(tt_list[b][n])]
-            trims.append(cap - n)
-            drafter.update_context(v_fused[b : b + 1, : n + 1, :],
-                                   ctx_offset=n_cached[b], ctx_caches=ctx_caches[b])
-            n_cached[b] += n + 1
-            trk.commit(b, committed, accept_len=len(committed))
-            pending[b] = trk.out_ids[b][-1]              # valid token even for finished rows
-        for c in caches:                                  # per-row rollback, every layer
-            c.trim(trims)
-
-    return trk.results(time.time() - t0)
+    if B == 0:
+        return []
+    mnt = _as_list(max_new_tokens, B)
+    ot = on_texts or [None] * B
+    sp = stops or [None] * B
+    slots = SpecSlots(target, tokenizer, drafter, capacity=B,
+                      max_draft_tokens=max_draft_tokens, batched_drafter=batched_drafter)
+    for i, ids in enumerate(prompts_ids):
+        slots.admit(ids, max_new_tokens=mnt[i], on_text=ot[i], stop=sp[i], meta=i)
+    results: list[GenResult | None] = [None] * B
+    while slots.n_active:
+        for meta, res in slots.step():
+            results[meta] = res
+    return results

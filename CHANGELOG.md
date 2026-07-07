@@ -4,6 +4,65 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-07 — dynamic batch admission, per-batch-width calibration, KV-cache quantization, checkpoint-format robustness
+
+### Added
+- **Dynamic batch admission (continuous batching M4).** `serve --max-batch N` greedy dspark
+  requests now run in a **slot session** (`batch_engine.SpecSlots`): a finished request is
+  delivered the instant its row retires (it no longer waits for the batch's slowest row), and the
+  freed slot admits the next queued/arriving request **mid-flight**. The batch dimension is never
+  resized — retirement compacts active rows to a contiguous prefix (one row-copy) and every forward
+  runs at the active width, so a lone tail request verifies at serial width (B_act=1 is the
+  bit-exact single-stream numeric path). Measured (Qwen3-4B-8bit, M4 Pro): a short request arriving
+  1.5 s into a 2-long-request session returned at **2.3 s wall vs 8.4 s** for the long rows.
+  Validated: B=1 bit-exact vs single-seq; identical prompts stay identical through staggered
+  retirements; a survivor row after the batch narrows is bit-exact vs serial.
+- **(B, cap) calibration grid.** `--max-draft auto` + `--max-batch N` now also measures the
+  *batched* verify curves (`calibrate.measure_batch_verify_grid`); `CapController.cap_for(B)`
+  picks a per-batch-width cap. Measured (Qwen3-4B-8bit, M4 Pro): at B=4 the verify curve is ~flat
+  from width 2 (8+ rows are already past the qmm knee — the paper's cheap-verify regime, measured)
+  so the controller picks cap 5 → **134.1 vs 128.0 tok/s aggregate (+5%)** over the single-stream
+  optimum cap 2, interleaved A/B.
+- **KV-cache quantization (`--kv-bits 4|8`, generate + serve).** Quantized target KV from token 0
+  (mlx-lm `QuantizedKVCache`) — cuts the KV share of the per-token bandwidth bill on long
+  contexts. Spec rollback trims and prefix caching work unchanged (the cache trims by pure offset
+  arithmetic). Validated: kv8 spec output == kv8 baseline byte-identical; ~70 tok/s dspark on
+  Qwen3-4B (no short-context regression). mlx-lm text targets only; disables `--max-batch`
+  (batched path falls back to serial automatically).
+- **`n` > 1 (chat + completions, non-stream).** Greedy: one generation serves all n identical
+  choices; sampled: n concurrent submissions (a `BatchEngine` batches them into one weight-read).
+  `n` with `stream=true` returns 400.
+- **CI** (`.github/workflows/ci.yml`): model-free test suite + ruff on every push/PR, plus a
+  weekly fresh-install canary (`scripts/smoke_install.sh --tests`) that catches transitive-dep
+  drift (the transformers-5.13 class of breakage) before users do.
+
+### Changed — robustness at the checkpoint-format boundary
+- **Loud errors instead of silent mis-parses.** `DSparkConfig.from_json` now detects and refuses,
+  with the real reason: vLLM **speculators**-format drafters (`RedHatAI/*-speculator.dspark` —
+  note their `model_type` says "qwen3" too), **embedded-drafter full models**
+  (`DeepSeek-V4-*-DSpark`), unknown drafter families (previously fell through to the gemma4
+  branch and died with a bare KeyError), and configs missing required DeepSpec fields.
+  `load_dflash` refuses DFlash+Markov community hybrids with the reason.
+- **Strict-by-default drafter loading.** A tensor-name mismatch now raises (a partially-loaded
+  drafter "works" with near-zero acceptance — worse than an error); `load_drafter(...,
+  strict=False)` restores warn-and-load.
+- **Generalized target routing.** `load_target` routes by capability, not name: multimodal
+  configs (`vision_config`/`audio_config`) → mlx-vlm; any `model_type` this mlx-lm ships a module
+  for (qwen3, llama, glm_moe_dsa, deepseek_v3, …, incl. mlx-lm's remap table) → mlx-lm; else
+  mlx-vlm with a helpful error. Drafter modes run a one-time **tap fidelity probe**
+  (`Target.verify_tap`): the replicated forward must reproduce the model's own logits on a tiny
+  input, and windowed/alternating-attention families are refused structurally — a family the
+  generic tap can't serve fails loudly instead of silently drafting from a wrong stream.
+
+### Fixed
+- **`BatchEngine` wedged the process at exit** (Ctrl-C'd server, scripts, tests): the scheduler
+  loop occupied the one MLX executor thread forever and `concurrent.futures`' shutdown hook joins
+  it. A stop sentinel + atexit-registered `close()` unblocks it (regular atexit handlers run
+  before the thread join).
+- Prefix caching now also accepts `QuantizedKVCache` targets (trim is offset arithmetic, same as
+  `KVCache`).
+- Benchmark subcommand: unused-import/`del`-vs-lambda lint traps cleaned; suite is ruff-clean.
+
 ## [0.2.0] — 2026-07-04 — continuous batching, penalties & logprobs, auto-calibration, prompt-lookup, decode-path performance
 
 ### Added

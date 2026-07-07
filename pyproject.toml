@@ -1,6 +1,6 @@
 [project]
 name = "mlx-dspark"
-version = "0.2.0"
+version = "0.3.0"
 description = "DSpark + DFlash speculative decoding (semi-autoregressive / block-diffusion drafting) for Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,3 +43,10 @@ packages = ["src/mlx_dspark"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+ignore = ["E741"]   # l/logits/layer single-letter names are idiomatic in the hot loops
+
+[tool.ruff.lint.per-file-ignores]
+# the transformers-compat shim must run before any mlx_lm import (issue #1)
+"src/mlx_dspark/__init__.py" = ["E402"]
