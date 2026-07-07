@@ -22,9 +22,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      - name: Install (locked to floor versions + dev tools)
+      - name: Install (resolves latest deps, like a user)
+        # setup-uv with python-version already creates + activates .venv in the workspace;
+        # --allow-existing keeps this line working either way
         run: |
-          uv venv
+          uv venv --allow-existing
           uv pip install -e ".[dev]"
       - name: Ruff
         run: uv run ruff check src tests
