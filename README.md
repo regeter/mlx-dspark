@@ -273,6 +273,19 @@ The binding limiter is acceptance length (set by the drafter↔target match) —
 (4-bit / 8-bit / bf16 give identical acceptance; 4-bit is simply fastest). After a drafter-slice fix and the
 `cap=2` default, verify dominates (~76% of each round).
 
+### Long context
+
+The speculative speedup **holds with context depth** — measured flat at ~1.6× out to 12k+ tokens on
+Qwen3-4B (M4 Pro). (Before v0.3.1 the drafter tiled its GQA/MQA KV cache redundantly every round, which
+scaled with depth and made speculation go *net-negative* past a few thousand tokens on cheap-verify
+targets; that's fixed — the fix is bit-for-bit identical output.) On expensive-verify targets (Gemma-12B)
+speculation actually *gains* slightly with depth, since the target slows faster than the cheap drafter.
+
+Two things do still grow with a longer prompt, for **every** decoder (baseline, `mlx-lm`, this) — not the
+speculative speedup: **time-to-first-token** (reading an *L*-token prompt is inherent work) and **per-token
+decode** (attention reads a longer KV cache). Soften both with prefix caching (reuse the conversation prefix
+across turns, on by default) and `--kv-bits 8` (quantized KV cache — the long-context bandwidth lever).
+
 ### DSpark vs DFlash (head-to-head)
 
 Three drafters from the same DeepSpec lineage, all EAGLE-family (a tiny drafter that consumes the *target's

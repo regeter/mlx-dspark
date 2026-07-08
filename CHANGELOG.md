@@ -4,6 +4,38 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-08 — long-context drafting fix + OpenAI structured-content messages
+
+### Fixed
+- **Speculative speedup no longer collapses at long context (cheap-verify targets).** The DSpark
+  drafter's cross-attention tiled its GQA/MQA K/V up to full heads (`_repeat_kv`, n_rep 4× on
+  Qwen, 16× on Gemma) across the **whole** context cache every round — `mx.fast.scaled_dot_product_attention`
+  already does that broadcast internally, so it was O(n_rep · ctx_len) of pure wasted memory
+  traffic that grew with depth. On cheap-verify targets (Qwen-class), where the drafter is the
+  dominant share of each round, it made long-context drafting go **net-negative past a few
+  thousand tokens** (measured Qwen3-4B-8bit, M4 Pro: decode speedup **0.62× at 8k, 0.57× at
+  12k** — spec *slower* than baseline, while accept length stayed a healthy ~2.7). Passing the
+  n_kv-head K/V straight to SDPA is **bit-for-bit identical** (same math, no redundant tiling)
+  and holds the speedup **flat at ~1.6× out to 12k+** (8k 0.62×→**1.65×**, 12k 0.57×→**1.58×**).
+  Validated lossless on every path: single-sequence (Qwen + Gemma, ids identical to the old code
+  at 256 and 6 k ctx), batched B=4 (per-row ids identical), and the batch suite. Expensive-verify
+  targets (Gemma-12B) never collapsed — the drafter is a small fraction there — so the change is
+  neutral-but-harmless for them (measured 8k: 1.39× before and after). Time-to-first-token still
+  grows with prompt length (that is the cost of reading the prompt, identical for baseline and
+  every framework — not this bug).
+- **OpenAI structured-content messages (`content` as a list of parts) no longer 400.** Coding
+  agents and OpenAI SDKs commonly send `content: [{"type": "text", "text": "…"}]` instead of a
+  plain string; that list reached the chat template unchanged and blew up inside it
+  (`could not apply chat template: 'list object' has no attribute 'startswith'`).
+  `normalize_tool_messages` now flattens the text parts to a string before templating (non-text
+  parts — images/audio — are dropped; the served text models can't consume them). A plain-string
+  `content` is byte-identical to before.
+
+### Added
+- `tests/test_model.py` — model-free guard that the drafter attention's native-GQA path is
+  numerically identical to explicit K/V tiling (so the tiling waste can't silently return);
+  `test_tools.py` gains structured-content cases. 136 model-free tests, ruff-clean.
+
 ## [0.3.0] — 2026-07-07 — dynamic batch admission, per-batch-width calibration, KV-cache quantization, checkpoint-format robustness
 
 ### Added

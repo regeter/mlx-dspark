@@ -62,3 +62,26 @@ def test_normalize_arguments_string_to_dict():
 def test_normalize_leaves_plain_messages():
     n = normalize_tool_messages([{"role": "user", "content": "hi"}])
     assert n[0] == {"role": "user", "content": "hi"}
+
+
+def test_normalize_list_content_to_string():
+    # OpenAI structured-content parts — what Pi/Continue/Cline & OpenAI SDKs send.
+    # A list reaching the chat template errors as "'list object' has no attribute 'startswith'".
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "Hello there"}]}]
+    n = normalize_tool_messages(msgs)
+    assert n[0]["content"] == "Hello there"
+
+
+def test_normalize_list_content_multipart_drops_nontext():
+    msgs = [{"role": "user", "content": [
+        {"type": "text", "text": "line1"},
+        {"type": "image_url", "image_url": {"url": "data:..."}},
+        {"type": "text", "text": "line2"},
+    ]}]
+    n = normalize_tool_messages(msgs)
+    assert n[0]["content"] == "line1\nline2"
+
+
+def test_normalize_empty_list_content():
+    n = normalize_tool_messages([{"role": "user", "content": []}])
+    assert n[0]["content"] == ""

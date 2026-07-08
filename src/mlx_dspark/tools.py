@@ -91,9 +91,31 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     return [_as_openai(name, args) for name, args in calls], cleaned.strip()
 
 
+def _flatten_content(content):
+    """OpenAI allows ``content`` to be a list of typed parts rather than a plain string
+    (``[{"type": "text", "text": "..."}, {"type": "image_url", ...}]``) — this is what many
+    coding agents / OpenAI SDKs send. The text targets we serve (and their chat templates)
+    expect a string; a list reaches the template unchanged and blows up inside it as
+    ``'list object' has no attribute 'startswith'``. So join the text parts (dropping
+    non-text parts — images/audio have no place in the text path) and hand the template a
+    string. A plain string / ``None`` is returned unchanged.
+    """
+    if not isinstance(content, list):
+        return content
+    parts = []
+    for p in content:
+        if isinstance(p, dict) and isinstance(p.get("text"), str):
+            parts.append(p["text"])
+        elif isinstance(p, str):
+            parts.append(p)
+    return "\n".join(parts)
+
+
 def normalize_tool_messages(messages: list[dict]) -> list[dict]:
     """Make an OpenAI message history renderable by the model chat templates:
 
+      * list-valued ``content`` (OpenAI structured content parts) -> concatenated text
+        (see :func:`_flatten_content`);
       * assistant ``function.arguments`` JSON strings -> dicts (templates iterate a mapping);
       * ``content: null`` -> ``""`` (OpenAI allows null content on tool-call messages, but the
         Qwen3 / Gemma-4 templates assume a string and error on ``None``).
@@ -101,6 +123,8 @@ def normalize_tool_messages(messages: list[dict]) -> list[dict]:
     out = []
     for m in messages:
         m = dict(m)
+        if "content" in m:
+            m["content"] = _flatten_content(m["content"])
         if m.get("content", "") is None:
             m["content"] = ""
         tcs = m.get("tool_calls")
