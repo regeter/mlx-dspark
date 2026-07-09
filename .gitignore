@@ -19,3 +19,9 @@ drafts/
 .claude/
 CLAUDE.md
 NOTES.md
+
+# SwiftLLMBar script symlinks
+scripts/SwiftLLMBar.1m.sh
+scripts/com.user.mlx-dspark.plist
+scripts/serve_gemma.sh
+

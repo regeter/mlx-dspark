@@ -205,6 +205,12 @@ def load_drafter(
         # Quantize Linear/Embedding weights; norms/scalars stay full precision.
         nn.quantize(drafter, group_size=group_size, bits=bits)
 
+    # Free memory of original weights if they are no longer needed
+    del weights
+    import gc
+    gc.collect()
+    mx.clear_cache()
+
     mx.eval(drafter.parameters())
     return drafter, config
 
