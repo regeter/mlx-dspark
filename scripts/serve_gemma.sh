@@ -1,0 +1,1 @@
+/Users/regeter/Services/SwiftLLMBar/serve_gemma.sh
