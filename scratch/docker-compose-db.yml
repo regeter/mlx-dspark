@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  postgresql:
+    image: pgvector/pgvector:16-pgdg
+    container_name: lobechat_postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=your_secure_db_password
+      - POSTGRES_DB=lobechat
+    volumes:
+      # Persistent storage on your Synology NAS
+      - /volume1/Docker/lobechat/postgres:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: lobechat_redis
+    environment:
+      - REDIS_PASSWORD=your_secure_redis_password
+    command: redis-server --requirepass your_secure_redis_password
+    volumes:
+      - /volume1/Docker/lobechat/redis:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "your_secure_redis_password", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO provides local S3-compatible storage for file uploads, images, and audio
+  minio:
+    image: minio/minio:latest
+    container_name: lobechat_minio
+    environment:
+      - MINIO_ROOT_USER=minio_admin
+      - MINIO_ROOT_PASSWORD=your_secure_minio_password
+    volumes:
+      - /volume1/Docker/lobechat/minio:/data
+    command: server /data --console-address ":9001"
+    restart: always
+    ports:
+      - "9000:9000"  # S3 API port
+      - "9001:9001"  # MinIO Web Console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Main LobeChat application running in server mode
+  lobechat:
+    image: lobehub/lobe-chat:latest
+    container_name: lobechat
+    ports:
+      - "3210:3210"
+    environment:
+      # --- System Configurations ---
+      - PUID=1000
+      - PGID=999
+      - TZ=Etc/UTC
+
+      # --- Enable Database/Server Mode ---
+      - NEXT_PUBLIC_SERVICE_MODE=server
+      - DATABASE_URL=postgresql://postgres:your_secure_db_password@postgresql:5432/lobechat
+      - REDIS_URL=redis://:your_secure_redis_password@redis:6379/0
+
+      # --- S3 File Storage Configuration ---
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET_NAME=lobechat
+      - S3_ACCESS_KEY_ID=minio_admin
+      - S3_SECRET_ACCESS_KEY=your_secure_minio_password
+      # Replace <YOUR_NAS_IP> with the IP of your NAS on your network
+      - S3_PUBLIC_DOMAIN=http://<YOUR_NAS_IP>:9000/lobechat
+
+      # --- NextAuth Session Encryption Key ---
+      # Generate a random 32-character string (e.g. run `openssl rand -base64 32`)
+      - NEXTAUTH_SECRET=generate_a_random_32_char_secret_key
+
+      # --- App Security Access Code ---
+      - ACCESS_CODE=your_secret_access_password
+
+      # --- Locked Local Model List ---
+      # Forces LobeChat to only show your native local model
+      - CUSTOM_MODELS=+AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-FP4,+mlx-community/gemma-4-12B-it-8bit,-all
+
+      # --- Cloud Providers (optional) ---
+      - OPENROUTER_API_KEY=
+      - ANTHROPIC_API_KEY=
+      - GEMINI_API_KEY=
+      - DEEPSEEK_API_KEY=
+
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: always
